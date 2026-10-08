@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fluximp-agent-sdk"
+version = "0.1.3"
+description = "FluxImp Agent SDK: allows authoring plugins for the run_tests tool that FluxImp Agent can provide for LLMs to use"
+readme = "README.md"
+authors = [
+    { name = "Josh Heitzman", email = "joshheitzman@hotmail.com" },
+]
+requires-python = ">=3.10,<3.13"
+license = "MPL-2.0"
+dependencies = []
