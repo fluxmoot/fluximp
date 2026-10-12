@@ -89,6 +89,9 @@ class AgentLogger:
                             self._log(f" token_usage.{k2}: {v2}")
                 else:
                     self._log(f"{k}: {v}")
+        if hasattr(response, 'usage_metadata') and response.usage_metadata:
+            self._log("")
+            self._log(f"response.usage_metadata: {response.usage_metadata}")
         self._log("")
         self._log(f"dir response: {dir(response)}")        
         self._log("")

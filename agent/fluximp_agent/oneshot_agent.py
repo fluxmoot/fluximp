@@ -453,6 +453,17 @@ def run_oneshot_file_io(
         print(f"Error: I/O directory does not exist: {io_path}")
         return
 
+    # Single-owner liveness lock (process_lock.py): same guard as the
+    # primary agent's file_io_mode — exactly one oneshot process
+    # (scrutinator / summarizer / report_only conditional; the readonly
+    # conditional runs through file_io_mode) may own an io directory. The
+    # lock's held-ness is also the GUI's liveness oracle for this dir.
+    from fluximp_agent.process_lock import DirLock
+    lock = DirLock.acquire(io_path, 'agent', wait_timeout=15.0)
+    if lock is None:
+        print(f"ERROR: another agent process holds the io directory lock "
+              f"on {io_path}; not starting.")
+        return
     # Create the FileIOAgentProtocol
     protocol = FileIOAgentProtocol(
         io_path=io_path,
@@ -600,3 +611,9 @@ def run_oneshot_file_io(
 
     finally:
         protocol.close_handles()
+        # Liveness lock (process_lock.py, see the acquisition above):
+        # released on every exit path — returns, exceptions, and the
+        # sys.exit(1) SystemExit. The OS auto-releases on process death,
+        # so the finally only keeps a same-process observer's verdict
+        # from lagging.
+        lock.release()

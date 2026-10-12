@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """
-Test runner plugin base class and data structures.
-
-This module defines the interface that all test runner plugins must implement.
-Plugins should import from this module: `from fluximp_agent_sdk.test_runner import ...`
+FluxImp test runner plugin abstract base class and data structures.
 """
 
 from abc import ABC, abstractmethod
@@ -98,32 +95,32 @@ class TestRunnerPlugin(ABC):
     - Generating commands for specific tests
     - Extracting diagnostic information from failures
     
-    This is "documentation as code" - the plugin encapsulates knowledge
-    about how to work with its test runner, preventing the need for
-    the model to understand each runner's specifics.
+    This is code-not-text - the plugin encapsulates knowledge
+    about how to work with its test runner, preventing the 
+    need documentation to tell an LLM how to run each individual
+    runner, how to determine if tests failed, and how to navigate
+    the structure of the tests.
     """
     
     def __init__(self, working_dir: Optional[str] = None, read_root_dir: Optional[str] = None):
         """Initialize the test runner plugin.
         
         Args:
-            working_dir: The working directory for file operations, as specified
-                        by the --working-dir CLI argument. Plugins can use this
-                        to locate project files relative to the project root.
+            working_dir: The working directory for agent file mutation, as specified
+                        by the --working-dir CLI argument.
             read_root_dir: The root directory for read/query operations, as specified
                           by the --read-root-dir CLI argument. May be an ancestor of
-                          working_dir, granting read access to a broader tree.
+                          the working directory.
         """
         self._working_dir = working_dir
         self._read_root_dir = read_root_dir
     
     @abstractmethod
     def get_runners(self) -> List[TestRunner]:
-        """Get the test runner configurations.
+        """Get the test runner instances.
         
         Returns:
-            List of TestRunner with executable, args, cost, and priority for running tests.
-            Existing plugins should return a 1-element list.
+            List of TestRunner instances with executable, args, cost, and priority for running tests.
         """
         pass
     
@@ -137,8 +134,8 @@ class TestRunnerPlugin(ABC):
                           plugin's get_plugin_name() method.
             
         Returns:
-            TestRunner configured to run just that test.
-            The cost field should be None since it's irrelevant for single tests.
+            TestRunner configured to run just the test matching the specified test identity.
+            The cost field irrelevant for single tests and may be None.
             
         Raises:
             ValueError: If the test_identity does not belong to this plugin
@@ -148,10 +145,10 @@ class TestRunnerPlugin(ABC):
     
     @abstractmethod
     def extract_diagnostics(self, result: RunResult) -> List[TestDiagnostics]:
-        """Extract diagnostic information from a failed test run.
+        """Get diagnostic information from a failed test run.
         
         Parses the output file and any other artifacts to produce
-        actionable diagnostic information for the model.
+        actionable diagnostic information for the LLM.
         
         Args:
             result: The RunResult from executing the test runner
@@ -163,11 +160,11 @@ class TestRunnerPlugin(ABC):
         pass
     
     def get_plugin_name(self) -> str:
-        """Get the unique name of this plugin.
+        """Get the unique name of this test runner plugin.
         
         This name is used as the prefix in test identities (e.g., "pytest:test_foo.py::test_bar").
         
         Returns:
-            Unique plugin name string
+            Unique test runner plugin name string
         """
         return self.__class__.__name__

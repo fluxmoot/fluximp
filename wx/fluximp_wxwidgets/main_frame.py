@@ -12,10 +12,13 @@ from fluximp_wxwidgets.file_watcher import FileWatcher
 from fluximp_wxwidgets.left_panel import LeftPanel
 from fluximp_wxwidgets.right_panel import RightPanel
 from fluximp_wxwidgets.conversation_tab import ConversationTab
+from fluximp_wxwidgets.tab_status_icons import get_status_icon
 from fluximp_wxwidgets.workflow_config import WorkflowConfigManager, STOCK_WORKFLOW_NAME
 from fluximp_wxwidgets.agent_tab import AgentTab
 from fluximp_wxwidgets.event_tab import EventTab
 from fluximp_wxwidgets.workspace_settings_tab import WorkspaceSettingsTab
+from fluximp_wxwidgets.app_settings import AppSettings
+from fluximp_wxwidgets.app_settings_tab import AppSettingsTab, NoCuratedProvidersDialog
 
 
 
@@ -88,11 +91,15 @@ class NewWorkflowDialog(wx.Dialog):
 class MainFrame(wx.Frame):
     """Main application frame with AUI layout."""
 
-    def __init__(self, parent=None, title="Fluximp Agent GUI", base_dir: Optional[Path] = None):
+    def __init__(self, parent=None, title="Fluximp Agent GUI", base_dir: Optional[Path] = None,
+                 app_settings: Optional[AppSettings] = None):
         # Initialize manager with base directory first (needed for config path)
         self.base_dir = base_dir or Path.home() / ".fluximp"
         self.manager = WorkspaceManager(base_dir=self.base_dir)
         self.config_mgr = WorkflowConfigManager(base_dir=self.base_dir)
+        # Application-level settings (main.py creates these before the frame
+        # so its startup curated-provider gate can read/persist them).
+        self.app_settings = app_settings or AppSettings(self.base_dir)
 
         # Load window state before creating window
         window_state = self._load_window_state()
@@ -113,6 +120,7 @@ class MainFrame(wx.Frame):
         self.open_agent_tabs: dict[str, AgentTab] = {}
         self.open_event_tabs: dict[str, EventTab] = {}
         self.open_workspace_settings_tabs: dict[str, WorkspaceSettingsTab] = {}
+        self.app_settings_tab: Optional[AppSettingsTab] = None
         self.current_workspace: Workspace = None
         
         # Centralized file watcher for all conversations
@@ -197,6 +205,10 @@ class MainFrame(wx.Frame):
         file_menu.Append(id_new_workflow, "New Workflow...")
         file_menu.Bind(wx.EVT_MENU, self._on_new_workflow, id=id_new_workflow)
         
+        id_app_settings = wx.NewIdRef()
+        file_menu.Append(id_app_settings, "Settings...")
+        file_menu.Bind(wx.EVT_MENU, self._on_app_settings, id=id_app_settings)
+        
         file_menu.AppendSeparator()
         
         id_exit = wx.ID_EXIT
@@ -256,7 +268,7 @@ class MainFrame(wx.Frame):
         )
         
         # Right panel - fork/turn grid
-        self.right_panel = RightPanel(self, self.config_mgr)
+        self.right_panel = RightPanel(self, self.config_mgr, app_settings=self.app_settings)
         self.right_panel.set_callbacks(
             on_turn_selected=self._on_turn_selected
         )
@@ -445,6 +457,46 @@ class MainFrame(wx.Frame):
         self.notebook.AddPage(tab, tab.get_title(), select=True)
         self.open_workspace_settings_tabs[ws_id] = tab
 
+    def _on_app_settings(self, event=None):
+        """Open (or activate) the application settings tab."""
+        if self.app_settings_tab is not None:
+            for i in range(self.notebook.GetPageCount()):
+                if self.notebook.GetPage(i) is self.app_settings_tab:
+                    self.notebook.SetSelection(i)
+                    return
+        tab = AppSettingsTab(
+            self.notebook, self.app_settings,
+            on_limit_to_curated_changed=self._on_limit_to_curated_changed)
+        self.notebook.AddPage(tab, tab.get_title(), select=True)
+        self.app_settings_tab = tab
+
+    def _on_limit_to_curated_changed(self, desired: bool) -> bool:
+        """Apply the curated-filter setting, gating on a usable provider.
+
+        Returns True when the requested value was applied.  Turning the
+        filter on when it would leave no provider with an API key set shows
+        the same turn-off-or-exit dialog used at startup: 'turn off' leaves
+        the setting off (returns False so the checkbox reverts), 'exit'
+        closes the frame.
+        """
+        if desired and not self.right_panel.has_providers_with_curated_filter():
+            dlg = NoCuratedProvidersDialog(self)
+            result = dlg.ShowModal()
+            dlg.Destroy()
+            if result != wx.ID_YES:
+                # Exit chosen: close the frame (the setting is moot).
+                self.Close()
+                return False
+            # "Turn Off Curated Filtering" chosen: keep the filter off and
+            # return False so the checkbox reverts to the persisted value.
+            self.app_settings.limit_providers_and_models_to_curated = False
+            self.right_panel.apply_curated_filter()
+            return False
+
+        self.app_settings.limit_providers_and_models_to_curated = desired
+        self.right_panel.apply_curated_filter()
+        return True
+
     def _on_start_conversation_from_workflow(self, workflow_name: str):
         """Handle Start Conversation from Workflows tab."""
         if not self.current_workspace:
@@ -554,7 +606,10 @@ class MainFrame(wx.Frame):
             self.open_tabs[conv_id] = tab
 
             title = tab.get_title()
-            self.notebook.AddPage(tab, title, select=True)
+            self.notebook.AddPage(
+                tab, title, select=True,
+                bitmap=get_status_icon(tab.get_status()))
+            tab.on_status_changed = lambda t=tab: self._apply_tab_status(t)
 
             # Force layout to compute proper sizes before showing
             tab.Layout()
@@ -585,6 +640,26 @@ class MainFrame(wx.Frame):
         self.file_watcher.register_conversation(conversation)
         wx.CallAfter(tab.history_controller.load_existing)
     
+    def _apply_tab_status(self, tab: ConversationTab):
+        """Update a conversation tab's header status icon (Option F).
+
+        Wired as the tab's on_status_changed callback; the tab dedupes, so
+        this fires only on a real status change and the notebook bitmap is
+        repainted on genuine transitions only.
+        """
+        try:
+            if self.open_tabs.get(tab.conversation.conversation_id) is not tab:
+                return
+            # SetPageBitmap takes a page *index*, not the page window (unlike
+            # AddPage, whose first arg is the window); resolve it here.
+            idx = self.notebook.GetPageIndex(tab)
+            if idx < 0:
+                return
+            self.notebook.SetPageBitmap(idx, get_status_icon(tab.get_status()))
+        except RuntimeError:
+            # Tab or notebook destroyed mid-update (teardown race).
+            pass
+
     def _get_current_tab(self) -> ConversationTab:
         """Get the currently active conversation tab."""
         idx = self.notebook.GetSelection()
@@ -675,6 +750,9 @@ class MainFrame(wx.Frame):
                 if tab == page:
                     del self.open_workspace_settings_tabs[ws_id]
                     break
+        elif isinstance(page, AppSettingsTab):
+            if self.app_settings_tab is page:
+                self.app_settings_tab = None
         self.notebook.DeletePage(idx)
     
 
@@ -712,6 +790,9 @@ class MainFrame(wx.Frame):
                 if tab == page:
                     del self.open_workspace_settings_tabs[ws_id]
                     break
+        elif isinstance(page, AppSettingsTab):
+            if self.app_settings_tab is page:
+                self.app_settings_tab = None
 
         event.Skip()
 

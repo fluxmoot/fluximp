@@ -1376,6 +1376,7 @@ class NovitaAIProvider(ModelProvider):
             "zai-org/glm-5.1",
             "zai-org/glm-4.7",
             "xiaomimimo/mimo-v2.5-pro",
+            "deepseek/deepseek-v4.1-flash",
             "deepseek/deepseek-v4-flash-0731",
             "deepseek/deepseek-v4-pro-0813",
             "minimax/minimax-m3",
@@ -1641,7 +1642,7 @@ class FireworksAIProvider(ModelProvider):
         return sorted(_models)
 
     def get_default_model(self) -> str:
-        default_model = "accounts/fireworks/models/glm-5p2"
+        default_model = "accounts/fireworks/models/glm-5p3-flash"
         assert default_model in self.get_model_names()
         return default_model
 
@@ -1656,12 +1657,13 @@ class WandBAIProvider(ModelProvider):
 
     def get_model_names(self) -> list[str]:
         _models = [
+            "deepseek-ai/DeepSeek-V4.1-Flash",
             "moonshotai/Kimi-K2.7-Code",
         ]
         return sorted(_models)
 
     def get_default_model(self) -> str:
-        default_model = "moonshotai/Kimi-K2.7-Code"
+        default_model = "deepseek-ai/DeepSeek-V4.1-Flash"
         assert default_model in self.get_model_names()
         return default_model
 
@@ -1676,10 +1678,11 @@ class DeepinfraComProvider(ModelProvider):
 
     def get_model_names(self) -> list[str]:
         _models = [
-            #"deepseek-ai/DeepSeek-V4-Pro", # preview version, use 0813 instead
+            "deepseek-ai/DeepSeek-V4.1-Flash",
             "deepseek-ai/DeepSeek-V4-Pro-0813",
-            #"deepseek-ai/DeepSeek-V4-Flash", # preview version, use 0731 instead
             "deepseek-ai/DeepSeek-V4-Flash-0731",
+            #"deepseek-ai/DeepSeek-V4-Pro", # preview version, use 0813 instead
+            #"deepseek-ai/DeepSeek-V4-Flash", # preview version, use 0731 instead
             # Configuration not complete for this provider
             # "zai-org/GLM-5.3",
             # "zai-org/GLM-5.3-Flash",
@@ -1722,14 +1725,20 @@ class TogetherAIProvider(ModelProvider):
             "MiniMaxAI/MiniMax-M3",
             "MiniMaxAI/MiniMax-M2.7",
             "MiniMaxAI/MiniMax-M2.5",
+            "zai-org/GLM-5.3",
+            "zai-org/GLM-5.3-Flash",
             "zai-org/GLM-5.2",
+            "deepseek-ai/DeepSeek-V4.1-Flash",
             "deepseek-ai/DeepSeek-V4-Pro-0813",
-            "deepseek-ai/DeepSeek-V4-Flash-0731",
+            # Deprecated on 10/22/2026
+            #"deepseek-ai/DeepSeek-V4-Flash-0731",
+            "moonshotai/Kimi-K3",
+            "Qwen/Qwen3.8-2.4T-A95B",
         ]
         return sorted(_models)
 
     def get_default_model(self) -> str:
-        default_model = "deepseek-ai/DeepSeek-V4-Flash-0731"
+        default_model = "zai-org/GLM-5.3-Flash"
         assert default_model in self.get_model_names()
         return default_model
 
@@ -1866,42 +1875,51 @@ class MakoraComProvider(ModelProvider):
 
     def get_model_names(self) -> list[str]:
         _models = [
-            "deepseek-ai/DeepSeek-V4-Flash",
+            "deepseek-ai/DeepSeek-V4.1-Flash",
             "moonshotai/Kimi-K3",
         ]
         return sorted(_models)
 
     def get_default_model(self) -> str:
-        default_model = "deepseek-ai/DeepSeek-V4-Flash"
+        default_model = "deepseek-ai/DeepSeek-V4.1-Flash"
         assert default_model in self.get_model_names()
         return default_model
     
-    def verify_model_response(self, requested_model: str, actual_model: str) -> None:
-        if requested_model == "deepseek-ai/DeepSeek-V4-Flash":
-            assert actual_model == requested_model or actual_model == "deepseek-ai/DeepSeek-V4-Flash-0731", f"Model mismatch: requested {requested_model}, got {actual_model}"
-
 _PROVIDERS = {
     "synthetic.new": SyntheticNewProvider,
     "chutes.ai": ChutesAIProvider,
-    "nano-gpt.com": NanoGPTProvider,
+    # Never got decent inference from this provider and searching indicated this
+    # was not an uncommon problem with them
+    #"nano-gpt.com": NanoGPTProvider,
     "opencode.ai": OpenCodeGoProvider,
     "minimax.io": MinimaxIOProvider,
     "z.ai": ZAIProvider,
-    "atlascloud.ai": AtlasCloudAIProvider,
+    # Haven't tried recently but they didn't respect the timeout provided, which
+    # isn't particularly unusual (lots of services never succeed after 6 minutes
+    # with a 10 minute timeout) but they have gateway timeouts them are particularly
+    # short
+    #"atlascloud.ai": AtlasCloudAIProvider,
     "novita.ai": NovitaAIProvider,
     "siliconflow.com": SiliconflowComProvider,
     "venice.ai": VeniceAIProvider,
     "gmi-serving.com": GmiServingComProvider,
-    "vanchin.streamlake.ai": VanchinStreamlakeAIProvider,
-    "parasail.io": ParasailIOProvider,
+    # Have to create your personal instance of an inference API endpoint
+    # so a non-public one is hardcoded in VanchinStreamlakeAIProvider current
+    # would need a custom UX to support streamlake.ai
+    #"vanchin.streamlake.ai": VanchinStreamlakeAIProvider,
+    # Their site isn't allowing top-up so can't use them anymore
+    #"parasail.io": ParasailIOProvider,
     "crusoecloud.com": CrusoecloudComProvider,
     "inceptron.io": InceptronIOProvider,
     "fireworks.ai": FireworksAIProvider,
     "wandb.ai": WandBAIProvider,
     "deepinfra.com": DeepinfraComProvider,
     "together.ai": TogetherAIProvider,
-    "akashml.com": AkashmlComProvider,
-    "featherless.ai": FeatherlessAIProvider,
+    # Tried briefly and didn't get quality inference
+    #"akashml.com": AkashmlComProvider,
+    # Tried briefly and didn't get quality inference seaching showed that wasn't
+    # uncommon
+    #"featherless.ai": FeatherlessAIProvider,
     "friendli.ai": FriendliAIProvider,
     "sailresearch.com": SailResearchComProvider,
     "digitalocean.com": DigitalOceanComProvider,
@@ -2330,15 +2348,20 @@ def get_model_config(provider: ModelProvider = None, model: str = None) -> Model
                     # 16384 seems to its own limit 4096
                     pass
                 elif provider.name == FriendliAIProvider.name:
-                    # 16384 no actual timeout, but did get a request that had not returned after 1730s
-                    # 10000 no timeouts
-                    max_completion_tokens = 10000
+                    if 'flash' in model_lower:
+                        # 16384 no actual timeout, but did get a request that had not returned after 1730s
+                        # 15000 unknown
+                        # 10000 no timeouts
+                        pass
                 elif provider.name == TogetherAIProvider.name:
-                    # 16384 got a 10 minute timeout and then 16384 output tokens on the retry
-                    # 12000 got a variety of timeouts without a successful rety
-                    # 8192 got a variety of timeouts without a successful rety for this too; maybe a point
-                    # in time issue with the service (i.e. try again later)
-                    max_completion_tokens = 8192
+                    if '5.3' in model_lower:
+                        pass
+                    else:
+                        # 16384 got a 10 minute timeout and then 16384 output tokens on the retry
+                        # 12000 got a variety of timeouts without a successful rety
+                        # 8192 got a variety of timeouts without a successful rety for this too; maybe a point
+                        # in time issue with the service (i.e. try again later)
+                        max_completion_tokens = 8192
                 elif provider.name == InceptronIOProvider.name:
                     if 'flash' in model_lower:
                         # The inference for this model suffers from the reasoning_content that
@@ -2504,9 +2527,10 @@ def get_model_config(provider: ModelProvider = None, model: str = None) -> Model
                         # Need for makora.com and probably needed for any other vllm providers
                         # so try it for everyone and address any specific error if they come up
                         "preserve_thinking": True,
-                        # Max seems pointless with max_completion_tokens <= 16384
+                        "clear_thinking": False,
                         "reasoning_effort": "high",
                     },
+                    "reasoning_effort": "high",
                 }
 
         elif "minimax-m2" in model_lower:
@@ -2540,9 +2564,10 @@ def get_model_config(provider: ModelProvider = None, model: str = None) -> Model
                 #'thinking': "enabled",
                 # As recommended here: https://recipes.vllm.ai/MiniMaxAI/MiniMax-M3
                 "top_k": 40,
-                # 'chat_template_kwargs': {
-                #     'thinking': "enabled",
-                # }
+                'chat_template_kwargs': {
+                     #'thinking': "enabled",
+                     "clear_thinking": False
+                }
             }
             if provider.name == "deepinfra.com":
                 # 16384 first uses no timeouts, but later to consecutive 10 minutes timeouts on the
@@ -2551,44 +2576,64 @@ def get_model_config(provider: ModelProvider = None, model: str = None) -> Model
         elif "deepseek-v4" in model_lower:
             # https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro-0813
             # https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731
-            # both of the final models (i.e. not the previews that lack the month and date)
-            # use these values for benchmarks for top_p and temperature
+            # https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash
+            # All three of these use the same top_p and temperature values
             temperature = 1.0
             top_p = 0.95
 
-            extra_body = {
-                "thinking": {"type": "enabled"},
-                "reasoning_effort": "high",
-            }
+            if '4.1' in model_lower or '4p1' in model_lower:
+                extra_body = {
+                    "reasoning_effort": "high",
+                }
+            else:
+                extra_body = {
+                    "thinking": {"type": "enabled"},
+                    "reasoning_effort": "high",
+                }
             if provider.name == SiliconflowComProvider.name:
                 if 'flash' in model_lower:
-                    # 16384
-                    extra_body["thinking_budget"] = 16384
+                    if True:
+                        # 16384
+                        extra_body["thinking_budget"] = 16384
+                    else:
+                        temperature = 0.9
+                        # 16384 max consecutive 10 minute timeouts on one request
+                        # 14000 10 minute timeout on the same request as above
+                        # 12000 10 minute timeout on the same request as above
+                        # 10000 didn't timeout on the same request as above, but did on the very next one
+                        # 9000
+                        extra_body["thinking_budget"] = 9000
                     extra_body["max_tokens"] = extra_body["thinking_budget"]
             elif provider.name == NovitaAIProvider.name:
-                # 16384 was okay for a while but eventually got a 10 minute time out followed by a succesful retry
-                # that with 5752 completion token and it took less than a minute
-                extra_body["thinking_mode"] = "thinking"
+                if '4.1' in model_lower:
+                    pass
+                else:
+                    # 16384 was okay for a while but eventually got a 10 minute time out followed by a succesful retry
+                    # that with 5752 completion token and it took less than a minute
+                    extra_body["thinking_mode"] = "thinking"
             elif provider.name == ParasailIOProvider.name:
                 pass
             elif provider.name == DeepinfraComProvider.name:
-                #temperature = 0.9
-                temperature = 0.7
-                if 'flash' in model_lower:
-                    # 16384 two consecutive 10 minute timeouts for the same request on one occasion
-                    # and a 10 minute timeout on another
-                    # 14000 two consecutive 10 minute timeouts for the same request
-                    # 13000 two consecutive 10 minute timeouts for the same request
-                    # 12000 timeouts happen but are very rare
-                    # 8192 no timeouts
-                    max_completion_tokens = 12000
+                if '4.1' in model_lower:
+                    pass
                 else:
-                    # 16384 two consecutive 10 minute timeouts for the same request on one occasion
-                    # 15000 no consecutive 10 minute timeouts but rate of timeout is annoying
-                    # 14000 10 minute timeouts 2x then 2 consecutive timeouts in same workflow
-                    # 13000 10 minute timeout 3x in the same workflow as immediately above
-                    # 12000
-                    max_completion_tokens = 12000
+                    #temperature = 0.9
+                    temperature = 0.7
+                    if 'flash' in model_lower:
+                        # 16384 two consecutive 10 minute timeouts for the same request on one occasion
+                        # and a 10 minute timeout on another
+                        # 14000 two consecutive 10 minute timeouts for the same request
+                        # 13000 two consecutive 10 minute timeouts for the same request
+                        # 12000 timeouts happen but are very rare
+                        # 8192 no timeouts
+                        max_completion_tokens = 12000
+                    else:
+                        # 16384 two consecutive 10 minute timeouts for the same request on one occasion
+                        # 15000 no consecutive 10 minute timeouts but rate of timeout is annoying
+                        # 14000 10 minute timeouts 2x then 2 consecutive timeouts in same workflow
+                        # 13000 10 minute timeout 3x in the same workflow as immediately above
+                        # 12000
+                        max_completion_tokens = 12000
             elif provider.name == SailResearchComProvider.name:
                 if 'flash' in model_lower:
                     # 16384 got a 10 minute timeout x 2 and then 3 consecutive 10 minute timeouts in the same workflow
@@ -2611,10 +2656,13 @@ def get_model_config(provider: ModelProvider = None, model: str = None) -> Model
             elif provider.name == InceptronIOProvider.name:
                 pass
             elif provider.name == TogetherAIProvider.name:
-                if 'flash' in model_lower:
-                    # 16384 got a 10 minute timeout
-                    # 15000
-                    max_completion_tokens = 1500
+                if '4.1' in model_lower:
+                    pass
+                else:
+                    if 'flash' in model_lower:
+                        # 16384 got a 10 minute timeout
+                        # 15000
+                        max_completion_tokens = 15000
             elif provider.name == VeniceAIProvider.name:
                 del extra_body['thinking']
                 extra_body['venice_parameters'] = {
@@ -2627,7 +2675,9 @@ def get_model_config(provider: ModelProvider = None, model: str = None) -> Model
                     # 15000 got a 10 minute timeout on the same request as above
                     # 12000
                     max_completion_tokens = 12000
-                temperature = 0.7
+                    temperature = 0.9
+            elif provider.name == WandBAIProvider.name:
+                pass
         elif "mimo-v2." in model_lower:
             # https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro#vllm-deployment
             # https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-RL#vllm
@@ -2686,6 +2736,7 @@ def get_model_config(provider: ModelProvider = None, model: str = None) -> Model
                     # Need for deepinfra.com and probably needed for any other vllm providers
                     # so try it for everyone and address any specific error if they come up
                     "preserve_thinking": True,
+                    "clear_thinking": False,
                 },
             }
             if provider.name == DeepinfraComProvider.name:
@@ -2860,6 +2911,9 @@ def get_model_capabilities(model_config: ModelConfig) -> ModelCapabilities:
                 no_tool_msg_for_errors = True
         elif model_config.provider.name == MakoraComProvider.name:
             if model_config.model in ("moonshotai/Kimi-K3",):
+                no_tool_msg_for_errors = True
+        elif model_config.provider.name == DeepinfraComProvider.name:
+            if model_config.model in ("MiniMaxAI/MiniMax-M3",):
                 no_tool_msg_for_errors = True
 
     

@@ -2,7 +2,7 @@
 
 FluxImp is an AI agent harness with a desktop GUI that provides customizable, durable workflows for editing text files (i.e. code), doing web research via APIs from providers like [TinyFish](https://www.tinyfish.ai/) and [Exa](https://exa.ai/), running Python scripts, and running arbitrary test runners through Python plugins that normailze test failures.
 
-FluxImp's approach to context management priotizes the direct conversation between yourself and the LLM by maintaining those messages verbatim.  Otherwise FluxImp is pretty aggressive about modifying the message history to limit context size and avoid context rot degrading LLM performance.
+FluxImp's approach to context management priotizes the direct conversation between yourself and the LLM by maintaining those messages verbatim.  Otherwise FluxImp is fairly aggressive about modifying the message history to limit context size and avoid context rot degrading LLM performance.  Only LLM inference provider's that return the full reasoning done by the LLMs are supported.  Currently this means **only open weight LLMs are supported**.
 
 The GUI allows you to customize most of the system prompt the harness provides to the LLMs.  The only parts you can't customize through the GUI are the instructions for tool use that are partly programatically generated based on the available tools (i.e. the limitation technical & UX not philosphical).
 
@@ -10,9 +10,53 @@ The GUI allows you to customize most of the system prompt the harness provides t
 
 ## Quick Start
 
-1) On Windows 10 or Windows 11 install Python 3.12 via [Miniforge Release 25.11.0-1](https://github.com/conda-forge/miniforge/releases/tag/25.11.0-1).  You could potentially use a newer version of Miniforge to install, but downgrading the Python version doesn't always work correctly.  Minforge 25.11.0-1 specifically installs version 3.12 of the Python.  If you already have Python 3.12 installed another way using that install should be fine.  **You can install Miniforge without it creating shortcuts or modifying the path.  In that case you need to use `<miniforge install dir>\python.exe` instead of `python` in the commands below.  Albeit slightly more hassle, this highly recommended to avoid system level headaches.**  You can create many independent, side-by-side Miniforge installations that use different versions of Python this way and they will not interfere with each other.
+### Windows Preliminaries
 
-2) Install the FluxImp packages:
+On Windows 10 or Windows 11 install Python 3.12 via [Miniforge Release 25.11.0-1](https://github.com/conda-forge/miniforge/releases/tag/25.11.0-1).  You could potentially use a newer version of Miniforge to install, but downgrading the Python version doesn't always work correctly.  Minforge 25.11.0-1 specifically installs version 3.12 of the Python.  If you already have Python 3.12 installed another way using that install should be fine.  **You can install Miniforge without it creating shortcuts or modifying the path.  In that case you need to use `<miniforge install dir>\python.exe` instead of `python` in the commands below.  Albeit slightly more hassle, this highly recommended to avoid system level headaches.**  You can create many independent, side-by-side Miniforge installations that use different versions of Python this way and they will not interfere with each other.
+
+### Linux Preliminaries
+
+Install Miniforge version 25.11.0-1 to get version 3.12 of Python.  You can skip activation when it asks and run it directly using `<miniforge install dir>/python` instead of just python to keep everything seperate between the Python installed with the distro and Miniforge installs of Python.
+
+```console
+cd ~/Downloads/
+wget https://github.com/conda-forge/miniforge/releases/download/25.11.0-1/Miniforge3-Linux-x86_64.sh
+bash Miniforge3-Linux-x86_64.sh
+```
+
+The fiddly part is getting wxPython version 4.2.5 installed.  If this works:
+
+```console
+python -m pip wxPython==4.2.5
+```
+
+then you're good to go.  If it fails to build, you could try to get things setup so that pip can build the wheel successfully.   You could also try installing using conda too.
+
+There are prebuilt wheels that can be installed, but you'll have to modify the URL to match your distro version and your Python interpreter version.  This URL in this command is known to work for Ubuntu version 24.04 with Python version 2.10:
+
+```console
+python -m pip install -U https://github.com/wxWidgets/Phoenix/releases/download/wxPython-4.2.5/wxpython-4.2.5+ubuntu2404-cp310-cp310-linux_x86_64.whl
+```
+
+There are two system dependencies that may not be in installed already.  They aren't necessary for the pip install of the prebuilt wheels to succeed and you could wait to see if you get an exception about not being able to import one or both when you start the GUI.  Or you could check and see if they are already installed:
+
+```console
+apt list --installed libsdl2-2.0-0 libpcre2-32-0
+```
+
+And install them if they are missing:
+
+```console
+sudo apt-get install libsdl2-2.0-0 libpcre2-32-0
+```
+
+### MacOS Preliminaries
+
+Unknown.  Probably similar to the Windows steps as wxPython has prebuilt wheels that should just work on MacOS.  While FluxImp was developed for 7 months on Windows without being tested on Linux at all, it just worked the first time it was tried on Linux (once the tricky wxWidgets install was sorted), so there is a good chance it will just work on MacOS too.
+
+### Install FluxImp
+
+1) Install the FluxImp packages:
 
 ```console
 python -m pip install fluximp-wxwidgets
@@ -22,7 +66,10 @@ python -m pip install fluximp-wxwidgets
 
 ```console
 python -m keyring set deepinfra.com api_key
+python -m keyring set together.ai api_key
 python -m keyring set friendli.ai api_key
+python -m keyring set fireworks.ai api_key
+python -m keyring set siliconflow.com api_key
 ```
 
 4) [Optionally] configure the keyring with at least one web search & fetch provider API key:
@@ -32,6 +79,7 @@ python -m keyring set tinyfish.ai api_key
 python -m keyring set exa.ai api_key
 python -m keyring set tavily.com api_key
 python -m keyring set perplexity.ai api_key
+python -m keyring set parallel.ai api_key
 ```
 
 5) Start the FluxImp desktop GUI
@@ -53,7 +101,7 @@ Same steps as above but substitute the following for steps 2 and 5 to run it dev
 ```console
 cd <repo parent dir>
 git clone https://github.com/fluxmoot/fluximp.git
-<miniforge install dir>\python.exe -m pip install openai==2.33.0 keyring==25.7.0 diff-match-patch==20241021 unidiff==0.7.5 python-ripgrep==0.0.9 langgraph==1.1.10 langchain-openai==1.2.1 rapidfuzz==3.14.3 wxPython==4.2.4 langgraph-checkpoint-sqlite==3.0.3 tavily-python==0.7.26 exa_py==2.16.0 linkup-sdk==0.18.3 parallel-web==1.1.0 perplexityai==0.40.0
+<miniforge install dir>\python.exe -m pip install openai==2.33.0 keyring==25.7.0 diff-match-patch==20241021 unidiff==0.7.5 python-ripgrep==0.0.9 langgraph==1.1.10 langchain-openai==1.2.1 rapidfuzz==3.14.3 wxPython==4.2.5 langgraph-checkpoint-sqlite==3.0.3 tavily-python==0.7.26 exa_py==2.16.0 linkup-sdk==0.18.3 parallel-web==1.1.0 perplexityai==0.40.0 mistune==3.3.4
 ```
 
 5. Start the FluxImp desktop GUI
@@ -77,7 +125,7 @@ Forks are not reversible.  You can not go back to the branch before a fork.
 
 ## Context Mangement
 
-**The primary goal of FluxImp's context management strategy is to maximize the amount of quality work done in each workflow.**  *The secondary goal is to maximize cached tokens in billing metrics.*
+**The primary goal of FluxImp's context management strategy is to maximize the amount of quality work done in each workflow.**  *The secondary goal is to maximize cached token usage.*
 
 Compaction eating the direct messages between yourself and the LLM is more likely to halt quality work than not, so compaction is not done.  Your messages to the LLM and the LLM's messages to you will always be included verbatim in the API requests.
 

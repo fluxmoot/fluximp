@@ -6,6 +6,16 @@ process, plus conversations whose backlog is being streamed after a reopen
 force-included regardless of process activity and share a per-tick wall-clock
 wallet (§7.3) so multiple parallel reloads never starve the GUI thread.
 
+A conversation is also active while an unattached (orphaned) agent holds its
+io dir's agent lock (process_lock.py) — a GUI restart/crash can leave the
+agent alive and owning the streams while the reopened GUI has no Popen for
+it. The held-lock arm keeps scanning those conversations (late records —
+e.g. a missed cancel_turn_ack — parse and route normally), a lock drop is
+recorded like a process exit (the 2s post-exit tail scans the holder's
+final bytes), and either verdict flip fires the conversation's
+on_liveness_changed so buttons/status re-render without a user action.
+Probes are TTL-cached (see _probe_lock_held / _conditional_lock_held).
+
 ``wake()`` interrupts the poll sleep so a send / permission response /
 subprocess launch renders on an immediately woken tick (§5.10) instead of
 waiting up to a full tick interval.
@@ -17,6 +27,7 @@ import logging
 from typing import Optional, Dict, List, Set
 
 from fluximp_protocol.user_agent.file_io.defs import MessageType
+from fluximp_agent.process_lock import probe as _probe_agent_lock
 
 
 class FileWatcher:
@@ -49,6 +60,14 @@ class FileWatcher:
         # conversation_id -> bool
         self._was_process_running: Dict[str, bool] = {}
 
+        # Liveness probe verdict caches (process_lock.py arm): TTL-bounded
+        # so the 50ms tick's per-conversation lock checks cost at most one
+        # syscall pair per interval per conversation. conversation_id ->
+        # (verdict, time.time()) for the primary io-dir lock; str(run_dir)
+        # -> (verdict, time.time()) for conditional run dirs.
+        self._lock_verdicts: Dict[str, tuple] = {}
+        self._run_lock_verdicts: Dict[str, tuple] = {}
+        self._lock_probe_interval = 0.5
         self.logger = logging.getLogger("file_watcher")
 
     def start(self):
@@ -91,6 +110,9 @@ class FileWatcher:
             self._conversations.pop(conversation_id, None)
             self._process_exit_times.pop(conversation_id, None)
             self._was_process_running.pop(conversation_id, None)
+            # Drop this conversation's liveness probe-cache entry (the
+            # run-dir cache is path-keyed and self-refreshes via TTL).
+            self._lock_verdicts.pop(conversation_id, None)
             # A mid-load close must never fire finish_reload afterwards.
             self._reloading.discard(conversation_id)
             self._failed_conversations.discard(conversation_id)
@@ -255,14 +277,71 @@ class FileWatcher:
                     result.append(conv)
         return result
 
+    def _probe_lock_held(self, conv, now: float) -> bool:
+        """True when the conversation's io-dir agent lock is held.
+
+        A held lock with no attached Popen means an unattached agent
+        process (orphaned by a GUI exit/crash) owns the io directory —
+        alive by lock, absorbed by the tab rather than respawned. Verdicts
+        are cached per conversation (a probe is a flock attempt or mutex
+        syscall); 'unknown' (probe failure) is never alive — callers
+        degrade to the attached-Popen-only behavior of the pre-lock era.
+        """
+        conv_id = conv.conversation_id
+        cached = self._lock_verdicts.get(conv_id)
+        if cached is not None and now - cached[1] < self._lock_probe_interval:
+            return cached[0] == 'held'
+        try:
+            verdict = _probe_agent_lock(conv.io_dir, 'agent')
+        except Exception:
+            verdict = 'unknown'
+        self._lock_verdicts[conv_id] = (verdict, now)
+        return verdict == 'held'
+
+    def _conditional_lock_held(self, conv, now: float) -> bool:
+        """True when any discovered conditional run dir's lock is held.
+
+        A conditional run orphaned by a GUI exit still owns its run dir
+        (each run dir is its own single-owner scope, process_lock.py)
+        while the primary agent may be dead; the held arm keeps the
+        conversation scanning so the run's report streams live during
+        this GUI session. Probe cost is TTL-bounded per run dir.
+        """
+        targets = getattr(conv, '_conditional_scan_targets', None)
+        if not targets:
+            return False
+        for run_dir in targets:
+            key = str(run_dir)
+            cached = self._run_lock_verdicts.get(key)
+            if (cached is not None
+                    and now - cached[1] < self._lock_probe_interval):
+                if cached[0] == 'held':
+                    return True
+                continue
+            try:
+                verdict = _probe_agent_lock(run_dir, 'agent')
+            except Exception:
+                verdict = 'unknown'
+            self._run_lock_verdicts[key] = (verdict, now)
+            if verdict == 'held':
+                return True
+        return False
+
     def _is_conversation_active(self, conv, now: float) -> bool:
-        """Check if a conversation has a running or recently running agent process.
+        """Check if a conversation has a running or recently running agent.
 
         A conversation is considered active if:
         - Its process is currently running (poll() returns None), OR
-        - Its process exited within the last 2 seconds, OR
-        - Its Popen object exists with an exited process but the exit has
-          not yet been recorded (ensures we scan for last output)
+        - Its process exited within the last 2 seconds (the post-exit tail
+          scan catches the final records), OR
+        - Its Popen object exists with an exited process whose exit has not
+          yet been recorded (ensures a scan for last output), OR
+        - Its io dir's agent lock is held (process_lock.py): no Popen
+          exists, but an unattached (orphaned) agent process owns the
+          conversation — alive by lock. The reopened GUI keeps streaming
+          its records through the ordinary scan path, OR
+        - Any discovered conditional run dir's lock is held (a conditional
+          orphan survived the GUI exit while the primary may be dead).
         """
         if conv.process is not None:
             if conv.process.poll() is None:
@@ -281,34 +360,72 @@ class FileWatcher:
             exit_time = self._process_exit_times.get(conv.conversation_id)
             if exit_time and now - exit_time < 2.0:
                 return True
+
+        # Alive-by-lock arms (process_lock.py): an unattached agent holds
+        # the primary io dir's lock (absorbed orphan — a missed
+        # cancel_turn_ack gets parsed the moment it lands), or an orphaned
+        # conditional run owns its run dir. Verdicts are TTL-cached.
+        if self._probe_lock_held(conv, now):
+            return True
+        if self._conditional_lock_held(conv, now):
+            return True
         return False
 
     def _check_process_status(self, now: float):
-        """Check for process starts and exits (used by _is_conversation_active)."""
+        """Check for liveness changes (attached process + lock verdicts).
+
+        A conversation's alive verdict folds in its io dir's agent-lock
+        probe (process_lock.py): with no attached Popen, ``held`` means an
+        unattached (orphaned) agent owns the conversation's streams — alive.
+        Verdict transitions are recorded exactly like attached-process
+        transitions:
+        - alive -> not stamps ``_process_exit_times`` so the 2-second
+          post-exit tail scans the holder's final bytes (an orphan's late
+          cancel_turn_ack lands in this window), and
+        - either flip fires the conversation's on_liveness_changed callback
+          (watcher thread; the owning tab marshals) so Stop/Resume/status
+          re-render without a user action.
+        """
         with self._lock:
             for conv_id, conv in self._conversations.items():
-                is_running = (
+                attached_alive = (
                     conv.process is not None and conv.process.poll() is None
                 )
+                # Only conversations without a live attached Popen are probed:
+                # the attached window owns the verdict, so a just-spawned
+                # GUI agent is never raced by the lock's acquire latency.
+                lock_alive = ((not attached_alive)
+                              and self._probe_lock_held(conv, now))
+                is_running = attached_alive or lock_alive
                 was_running = self._was_process_running.get(conv_id, False)
 
+                transition_cb = None
                 if is_running and not was_running:
-                    # Process started
+                    # Started: a GUI attach, or an orphan discovered alive
+                    # by lock on the first check after registration.
                     self._was_process_running[conv_id] = True
                     self._process_exit_times.pop(conv_id, None)
-
+                    transition_cb = getattr(conv, "on_liveness_changed", None)
                 elif not is_running and was_running:
-                    # Process exited (was running, now not)
+                    # Exited: the attached Popen, or a held lock dropped (a
+                    # live orphan wrote its last record and quit). The exit
+                    # stamp drives the 2s post-exit tail for both shapes.
                     self._was_process_running[conv_id] = False
                     self._process_exit_times[conv_id] = now
-
+                    transition_cb = getattr(conv, "on_liveness_changed", None)
                 elif not is_running and not was_running:
-                    # Process not running and was never seen running
-                    # Check if it has a Popen object with an exited process
-                    # that we haven't recorded yet
-                    if (
-                        conv.process is not None
-                        and conv.process.poll() is not None
-                        and conv_id not in self._process_exit_times
-                    ):
+                    # Not running and never seen running: record an
+                    # attached-but-exited Popen exactly once so the 2s tail
+                    # still scans for last output.
+                    if (conv.process is not None
+                            and conv.process.poll() is not None
+                            and conv_id not in self._process_exit_times):
                         self._process_exit_times[conv_id] = now
+
+                if transition_cb is not None:
+                    try:
+                        transition_cb()
+                    except Exception:
+                        self.logger.exception(
+                            f"on_liveness_changed callback failed for {conv_id}"
+                        )

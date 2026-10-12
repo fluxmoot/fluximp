@@ -77,6 +77,15 @@ def _create_usage_metadata_with_top_level_reasoning(oai_token_usage, service_tie
 
 langchain_openai.chat_models.base._create_usage_metadata = _create_usage_metadata_with_top_level_reasoning
 
+_reasoning_return_fields = None
+def set_curated_model(curated_model):
+    global _reasoning_return_fields
+    assert len(curated_model.reasoning_return_fields) > 0
+    _reasoning_return_fields = list(curated_model.reasoning_return_fields)
+    _reasoning_return_fields.sort()
+    _reasoning_return_fields = tuple(_reasoning_return_fields)
+    print("DEBUG _reasoning_return_fields:", _reasoning_return_fields)
+
 original_convert_message_to_dict = langchain_openai.chat_models.base._convert_message_to_dict
 
 def _convert_message_to_dict_with_reasoning(
@@ -85,20 +94,26 @@ def _convert_message_to_dict_with_reasoning(
 ) -> dict:
     message_dict = original_convert_message_to_dict(message, api)
     if isinstance(message, AIMessage):
+        reasoning_received_field = None
         reasoning_content = message.additional_kwargs.get("reasoning_content")
-        if reasoning_content:
-            message_dict["reasoning_content"] = reasoning_content
-            # Duplicate the reasoning in the reasoning field as well as the reasoning_content field
-            # as a workaround to some defects in vLLM and chat templates
-            # This hack didn't work and fireworks.ai kimi k2.7 code didn't like this
-            # message_dict["reasoning"] = reasoning_content
-        reasoning = message.additional_kwargs.get("reasoning")
-        if reasoning:
-            message_dict["reasoning"] = reasoning
-            # Duplicate the reasoning in thereasoning_content field as well as the content field
-            # as a workaround to some defects in vLLM and chat templates
-            # This is required for Kimi K3 @ makora.com
-            message_dict["reasoning_content"] = reasoning
+        if reasoning_content is None:
+            reasoning_content = message.additional_kwargs.get("reasoning")
+            if reasoning_content is not None:
+                reasoning_received_field = "reasoning"
+        else:
+            reasoning_received_field = "reasoning_content"
+
+        if reasoning_received_field is not None:
+            print("DEBUG _reasoning_return_fields 2:", _reasoning_return_fields)
+            if _reasoning_return_fields:
+                for f in _reasoning_return_fields:
+                    print("DEBUG reasoning returned in field:", f)
+                    message_dict[f] = reasoning_content
+            else:
+                print("DEBUG reasoning returned in field received in:", reasoning_received_field)
+                message_dict[reasoning_received_field] = reasoning_content
+        else:
+            print("DEBUG reasoning_received_field is None")
 
         # Fix invalid tool_calls.function.arguments
         # LangChain _lc_invalid_tool_call_to_openai_tool_call passes args

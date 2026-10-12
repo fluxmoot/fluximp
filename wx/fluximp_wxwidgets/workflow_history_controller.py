@@ -227,6 +227,18 @@ class WorkflowHistoryController:
     def _remove_item(self, item: Optional[HistoryItem]):
         if item is None:
             return
+        # Logging plan (2026-10-10 resume-desync diagnosis): the ONLY destroy
+        # path for a rendered history item. One INFO line per teardown —
+        # identity, coordinates, whether a widget existed, and how much
+        # content died with it — makes "which cards were destroyed when"
+        # answerable straight from the log (the question the 02:10 app log
+        # could not answer while tool expanders vanished silently).
+        self._logger.info(
+            "destroying item: kind=%s fork=%s turn=%s seq=%s agent=%r "
+            "run=%r materialized=%s messages=%s",
+            item.item_id.kind, item.item_id.fork, item.item_id.turn,
+            item.item_id.seq, item.item_id.agent_name, item.item_id.run_id,
+            self._widget(item) is not None, len(item.messages))
         self._items_by_id.pop(item.item_id, None)
         if item in self._items:
             self._items.remove(item)
@@ -318,6 +330,9 @@ class WorkflowHistoryController:
             old = self._conditional_cards.pop(key, None)
             if old:
                 self._remove_item(self._items_by_id.get(old))
+                self._logger.info(
+                    "conditional request card replaced (replayed seq): "
+                    "run_id=%s seq=%s", run_id, request_seq)
             item = HistoryItem(
                 item_id=HistoryItemId('card', a_fork, a_turn,
                                       agent_name=agent, run_id=run_id, seq=request_seq),
@@ -326,22 +341,59 @@ class WorkflowHistoryController:
             self._add_item(item)
             self._conditional_cards[key] = item.item_id
             self._materialize(item)
+            self._logger.info(
+                "conditional request card created: fork=%s turn=%s seq=%s "
+                "agent=%r run=%s", a_fork, a_turn, request_seq, agent, run_id)
         else:
             key = (fork, turn, request_seq)
             old = self._current_cards.pop(key, None)
             if old:
                 self._remove_item(self._items_by_id.get(old))
+                self._logger.info(
+                    "request card replaced (replayed request_seq): fork=%s "
+                    "turn=%s seq=%s", fork, turn, request_seq)
             # Retry supersede (§5.2): a new REQUEST at the same (fork, turn)
             # with an advanced request_seq drops any stale still-pending card
             # at those coordinates (agent retry), matching the old
             # _create_request_card cleanup of obsolete pending cards.
+            # Fix B (2026-10-10 resume desync): destroying a stale pending
+            # card that already carries streamed content (tool sections from
+            # the superseded cycle) destroys the turn's history with it and
+            # produced the "no tool expanders on the resumed turn" symptom.
+            # An EMPTY stale card (a pure placeholder) is still removed; a
+            # content-carrying one is KEPT and settles to the cancelled state
+            # instead, staying registered in _current_cards so its own late
+            # content still routes to it.
             stale = []
             for (k_fork, k_turn, k_seq), iid in list(self._current_cards.items()):
                 if (k_fork, k_turn) == (fork, turn) and k_seq != request_seq:
                     stale_item = self._items_by_id.get(iid)
-                    if stale_item is not None and stale_item.pending:
-                        stale.append((k_fork, k_turn, k_seq))
-                        self._remove_item(stale_item)
+                    if stale_item is None or not stale_item.pending:
+                        continue
+                    if stale_item.messages:
+                        # Content-carrying stale pending card: keep it as
+                        # cancelled (Fix B) — removing it took the tool
+                        # expanders of a cycle that really streamed with it.
+                        stale_item.pending = False
+                        card = self._widget(stale_item)
+                        if card is not None and hasattr(card, 'clear_pending'):
+                            try:
+                                card.clear_pending()
+                            except WX_FAILURES:
+                                pass
+                        self._logger.warning(
+                            "stale pending card KEPT as cancelled (Fix B): "
+                            "fork=%s turn=%s seq=%s messages=%s (superseded "
+                            "by request_seq=%s; content preserved)",
+                            k_fork, k_turn, k_seq, len(stale_item.messages),
+                            request_seq)
+                        continue
+                    stale.append((k_fork, k_turn, k_seq))
+                    self._remove_item(stale_item)
+                    self._logger.info(
+                        "stale pending card removed (retry supersedes §5.2): "
+                        "fork=%s turn=%s seq=%s messages=0 (new "
+                        "request_seq=%s)", k_fork, k_turn, k_seq, request_seq)
             for sk in stale:
                 self._current_cards.pop(sk, None)
             item = HistoryItem(
@@ -350,6 +402,9 @@ class WorkflowHistoryController:
             self._add_item(item)
             self._current_cards[key] = item.item_id
             self._materialize(item)
+            self._logger.info(
+                "request card created: fork=%s turn=%s seq=%s item=%s",
+                fork, turn, request_seq, item.item_id)
         card = self._widget(item)
         if card is not None:
             try:
@@ -483,6 +538,16 @@ class WorkflowHistoryController:
             item = self._items_by_id.get(self._current_cards.get(
                 (message.fork, message.turn, 0)))
         if item is None:
+            # Fix B.c (2026-10-10 resume desync): a TOOL_USE_RESULT whose
+            # card was missing vanished silently here — the pre-fix desync
+            # turned every resumed-turn tool result into one of these drops.
+            # The card is gone, so there is still nothing to render onto, but
+            # this must no longer be a silent data loss.
+            self._logger.warning(
+                "tool-result update dropped: no card for fork=%s turn=%s "
+                "request_seq=%s role=%r — the card this update belongs to "
+                "was removed before the result arrived",
+                message.fork, message.turn, request_seq, message.role)
             return
         card = self._widget(item)
         if card is not None:
@@ -674,9 +739,73 @@ class WorkflowHistoryController:
         self._schedule_flush()
 
     def _find_primary_card(self, fork: int, turn: int, request_seq: int) -> Optional[HistoryItem]:
+        # The (f, t, 0) fallback below is a band-aid for legacy/desync streams
+        # (plan note, 2026-10-10) and intentionally carries no log of its own:
+        # post-Fix A/B any positive-seq miss routes through
+        # _desync_primary_card (WARNING, Fix B.b) or on_message_updated's drop
+        # warning (Fix B.c), and an (f, t, 0) card can only exist after an
+        # already-WARNED orphan-response event (the parse layer's
+        # empty-queue WARNING plus the controller's legacy-fallback creation
+        # WARNING) — so a silent hit on this fallback is always preceded by
+        # warnings that name the desync, and the pairing-diagnostic trail
+        # stays complete (review note, initial code review: adding a separate
+        # log here would be unreachable dead code).
         item = self._items_by_id.get(self._current_cards.get((fork, turn, request_seq)))
         if item is None and request_seq > 0:
             item = self._items_by_id.get(self._current_cards.get((fork, turn, 0)))
+        return item
+
+    def _desync_primary_card(self, message: ConversationMessage,
+                             request_seq: int, pending: bool,
+                             route: str) -> HistoryItem:
+        """Fix B (2026-10-10 resume pairing desync): find-or-create the card a
+        primary message routes to when its own (fork, turn, request_seq) has no
+        card.
+
+        The pre-fix fallback always created a NEW card here; in the
+        resumed-turn desync every response popped an orphan seq whose card the
+        retry-supersede had just destroyed, so each cycle spawned an extra
+        contentless response card while the live request's card — the one
+        holding the tool sections — was destroyed at the next REQUEST (the
+        "no tool expanders on the resumed turn" symptom). Prefer the turn's
+        own most recent card (the live pending request if one exists, else the
+        newest card) so a desynced message lands on the request it actually
+        belongs to, and alias the unrouted seq onto that card so later lookups
+        for it stay correct. With no card at all for the turn, keep the legacy
+        create-new fallback (logged).
+        """
+        fork, turn = message.fork, message.turn
+        candidates = []
+        for (k_fork, k_turn, _k_seq), iid in self._current_cards.items():
+            if (k_fork, k_turn) != (fork, turn):
+                continue
+            cand = self._items_by_id.get(iid)
+            if cand is not None:
+                candidates.append(cand)
+        if candidates:
+            pending_cands = [c for c in candidates if c.pending]
+            chosen = pending_cands or candidates
+            item = max(chosen, key=lambda c: c.item_id.seq)
+            self._current_cards[(fork, turn, request_seq)] = item.item_id
+            self._logger.warning(
+                "request/response pairing desync (Fix B): %s for fork=%s "
+                "turn=%s seq=%s has no card — attaching to existing card "
+                "seq=%s (pending=%s, messages=%s)",
+                route, fork, turn, request_seq, item.item_id.seq,
+                item.pending, len(item.messages))
+            return item
+        self._logger.warning(
+            "request/response pairing desync (Fix B): %s for fork=%s turn=%s "
+            "seq=%s has no card and the turn has none — creating a new card "
+            "(legacy fallback)",
+            route, fork, turn, request_seq)
+        item = HistoryItem(
+            item_id=HistoryItemId('card', fork, turn, seq=request_seq),
+            fork=fork, turn=turn, metadata=dict(message.metadata),
+            pending=pending)
+        self._add_item(item)
+        self._current_cards[(fork, turn, request_seq)] = item.item_id
+        self._materialize(item)
         return item
 
     def _route_primary_api_response(self, message: ConversationMessage):
@@ -684,12 +813,11 @@ class WorkflowHistoryController:
         request_seq = md.get('request_seq', 0)
         item = self._find_primary_card(message.fork, message.turn, request_seq)
         if item is None:
-            item = HistoryItem(
-                item_id=HistoryItemId('card', message.fork, message.turn, seq=request_seq),
-                fork=message.fork, turn=message.turn, metadata=dict(md), pending=False)
-            self._add_item(item)
-            self._current_cards[(message.fork, message.turn, request_seq)] = item.item_id
-            self._materialize(item)
+            # Fix B (2026-10-10 pairing desync): a response whose popped seq
+            # has no card must not silently spawn a duplicate card — route it
+            # to the turn's live card (the actual in-flight request).
+            item = self._desync_primary_card(
+                message, request_seq, pending=False, route='response')
         item.messages.append(message)
         item.pending = False
         card = self._widget(item)
@@ -714,12 +842,10 @@ class WorkflowHistoryController:
         request_seq = md.get('request_seq', 0)
         item = self._find_primary_card(message.fork, message.turn, request_seq)
         if item is None:
-            item = HistoryItem(
-                item_id=HistoryItemId('card', message.fork, message.turn, seq=request_seq),
-                fork=message.fork, turn=message.turn, metadata=dict(md), pending=True)
-            self._add_item(item)
-            self._current_cards[(message.fork, message.turn, request_seq)] = item.item_id
-            self._materialize(item)
+            # Fix B (2026-10-10 pairing desync): prefer the turn's live card
+            # over spawning an orphan one (see _desync_primary_card).
+            item = self._desync_primary_card(
+                message, request_seq, pending=True, route='tool_use')
         item.messages.append(message)
         card = self._widget(item)
         if card is not None:
@@ -743,12 +869,10 @@ class WorkflowHistoryController:
         request_seq = md.get('request_seq', 0)
         item = self._find_primary_card(message.fork, message.turn, request_seq)
         if item is None:
-            item = HistoryItem(
-                item_id=HistoryItemId('card', message.fork, message.turn, seq=request_seq),
-                fork=message.fork, turn=message.turn, metadata=dict(md), pending=True)
-            self._add_item(item)
-            self._current_cards[(message.fork, message.turn, request_seq)] = item.item_id
-            self._materialize(item)
+            # Fix B (2026-10-10 pairing desync): prefer the turn's live card
+            # over spawning an orphan one (see _desync_primary_card).
+            item = self._desync_primary_card(
+                message, request_seq, pending=True, route='permission')
         item.messages.append(message)
         # §5.5: during a reload the backlog's permission requests render
         # resolved (no live approve/deny surface). Finalization re-arms the
@@ -792,6 +916,26 @@ class WorkflowHistoryController:
         return info.status in (ConversationStatus.COMPLETED,
                                ConversationStatus.ERROR,
                                ConversationStatus.CANCELLED)
+
+    def has_pending_permission(self, fork: int, turn: int) -> bool:
+        """True when (fork, turn) has an unanswered permission request.
+
+        The header-status approval signal (Option 2e): a live turn with a
+        permission request the agent is blocked on.  Terminal turns are
+        excluded (their pending marker is dropped).
+        """
+        if (fork, turn) not in self._pending_permissions:
+            return False
+        return not self.is_turn_terminal(fork, turn)
+
+    def mark_permission_answered(self, fork: int, turn: int) -> None:
+        """Clear (fork, turn)'s pending-permission marker on user answer.
+
+        The agent resumes on the same turn, so the turn's terminal events do
+        not clear the marker; the response path calls this so the header icon
+        leaves 'approval' the moment Approve/Deny lands (Option 2e).
+        """
+        self._deactivate_permissions_for_turn(fork, turn)
 
     def _deactivate_permissions_for_turn(self, fork: int, turn: int):
         item_ids = self._pending_permissions.pop((fork, turn), set())

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fluximp-protocol"
-version = "0.1.3"
+version = "0.2.0"
 description = "FluxImp Protocol: the communication protocol between the FluxImp Agent and FluxImp GUI"
 readme = "README.md"
 authors = [
@@ -13,3 +13,6 @@ authors = [
 requires-python = ">=3.10,<3.13"
 license = "MPL-2.0"
 dependencies = []
+
+[project.urls]
+"Homepage" = "https://fluximp.org"

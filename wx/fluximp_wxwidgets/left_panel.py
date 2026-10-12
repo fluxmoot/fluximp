@@ -227,9 +227,6 @@ class WorkspaceTreeCtrl(wx.TreeCtrl):
         # Count conversations for warning
         conv_count = len(workspace.conversations)
         
-        menu.Append(wx.ID_ANY, f"Path: {workspace.path}")
-        menu.AppendSeparator()
-        
         id_new_default = wx.NewIdRef()
         menu.Append(id_new_default, f"New {workspace.get_default_workflow()}")
 
@@ -237,17 +234,17 @@ class WorkspaceTreeCtrl(wx.TreeCtrl):
         menu.Append(id_new_workflow, "New Workflow...")
         menu.Bind(wx.EVT_MENU, lambda e: self._on_new_workflow(workspace), id=id_new_workflow)
 
+        menu.AppendSeparator()
+
         id_settings = wx.NewIdRef()
         menu.Append(id_settings, "Settings...")
         menu.Bind(wx.EVT_MENU, lambda e: self._on_workspace_settings(workspace), id=id_settings)
         menu.Bind(wx.EVT_MENU, lambda e: self._on_create_default_workflow(workspace), id=id_new_default)
-        
-        menu.AppendSeparator()
-        
+
         id_remove = wx.NewIdRef()
-        menu.Append(id_remove, "Remove from List")
+        menu.Append(id_remove, "Remove from Tree")
         menu.Bind(wx.EVT_MENU, lambda e: self._on_remove_workspace(item, workspace), id=id_remove)
-        
+
         id_delete = wx.NewIdRef()
         menu.Append(id_delete, f"Delete Workspace ({conv_count} workflows)")
         menu.Bind(wx.EVT_MENU, lambda e: self._on_delete_workspace(item, workspace), id=id_delete)
@@ -285,7 +282,7 @@ class WorkspaceTreeCtrl(wx.TreeCtrl):
             self.on_workspace_settings(workspace)
     
     def _on_remove_workspace(self, item: wx.TreeItemId, workspace: Workspace):
-        """Remove workspace from list (doesn't delete files)."""
+        """Remove workspace from tree (doesn't delete files)."""
         # Refuse if any conversation in this workspace has an open tab: the
         # tab owns the Conversation object, so removing the workspace under it
         # would orphan the tab's conversation reference.

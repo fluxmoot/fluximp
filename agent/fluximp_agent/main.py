@@ -26,6 +26,7 @@ from fluximp_agent.time_travel import create_checkpointer
 from fluximp_agent.checkpoint_markers import write_checkpoint_marker
 
 from fluximp_agent.model_config import get_model_config, create_provider, get_default_provider_name, get_provider_names, get_model_capabilities
+from fluximp_agent.curated_models import curated_model_by_model_name_by_provider_name
 from fluximp_agent.agent_config import AgentConfig
 
 # Import tool functions from the tool_funcs package
@@ -184,6 +185,21 @@ def file_io_mode(filesystem_service: FileSystemService, agent_config: AgentConfi
         print(f"Error: I/O directory does not exist: {io_path}")
         return
 
+    # Single-owner liveness lock (process_lock.py): exactly one agent
+    # process may own an io directory — a second process on the same io
+    # streams would race input files and duplicate expensive turns. The
+    # bounded retry absorbs a legitimate ownership handoff window (a
+    # terminate-then-restart whose prior holder is still draining its
+    # graceful/SIGTERM/SIGKILL ladder, ~9s worst case). On timeout this
+    # exits instead of racing; the same lock's held-ness (auto-released
+    # when the holder dies, including a crash) is the GUI's exact
+    # is-an-agent-alive oracle for the io dir. See process_lock.py.
+    from fluximp_agent.process_lock import DirLock
+    lock = DirLock.acquire(io_path, 'agent', wait_timeout=15.0)
+    if lock is None:
+        print(f"ERROR: another Fluximp agent process holds the io "
+              f"directory lock on {io_path}; not starting.")
+        return
     # Create logger with agent_config
     logger = AgentLogger(agent_config, verbose=True)
     logger.start_session()
@@ -616,6 +632,14 @@ def file_io_mode(filesystem_service: FileSystemService, agent_config: AgentConfi
         sys.stdout.flush()
         sys.exit(1)
 
+    finally:
+        # Liveness lock (process_lock.py, see the acquisition above):
+        # released on every exit path — the returns above, the break out
+        # of the coordinator loop, exceptions, and the sys.exit(1)
+        # SystemExit. The OS auto-releases on process death, so the
+        # finally only keeps a same-process observer's verdict from
+        # lagging.
+        lock.release()
     logger.end_session()
 
 
@@ -699,6 +723,7 @@ def main() -> int:
             print("Error: fluximp-agent-sdk is not installed; the run_tests "
                   "tool is disabled. Install fluximp-agent-sdk to enable it.")
             args.test_runner_plugin_dir = None
+
     try:
         # Create the filesystem service with the working directory and optional read root directory
         filesystem_service = FileSystemService(working_dir=args.working_dir, read_root_dir=args.read_root_dir, write_file=args.write_file)
@@ -863,6 +888,15 @@ def main() -> int:
 
         if args.test_runner_plugin_dir is None:
             tool_names_to_drop.append('run_tests')
+
+        curated_model_by_model_name = curated_model_by_model_name_by_provider_name.get(model_config.provider.name)
+        print("DEBUG curated_model_by_model_name: ", curated_model_by_model_name)
+        if curated_model_by_model_name is not None:            
+            curated_model = curated_model_by_model_name.get(model_config.model)
+            print("DEBUG curated_model: ", curated_model)
+            if curated_model is not None:
+                from fluximp_agent.openai_api_client import set_curated_model
+                set_curated_model(curated_model)        
 
         if args.agent_type == 'scrutinator':
             from fluximp_agent import scrutinator

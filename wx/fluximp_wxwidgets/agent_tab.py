@@ -28,28 +28,43 @@ class AgentTab(wx.Panel):
         name_sizer.Add(self.name_ctrl, 1, wx.EXPAND)
         sizer.Add(name_sizer, 0, wx.EXPAND | wx.ALL, 10)
 
-        # Tools section
-        tools_label = wx.StaticText(self, label="Tools:")
-        font = tools_label.GetFont()
-        font.SetWeight(wx.FONTWEIGHT_BOLD)
-        tools_label.SetFont(font)
-        sizer.Add(tools_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
+        # Tools section: 4 groups inside an "Agent Tools" box
+        tools_box = wx.StaticBox(self, label="Agent Tools")
+        bold_font = tools_box.GetFont()
+        bold_font.SetWeight(wx.FONTWEIGHT_BOLD)
+        tools_sizer = wx.StaticBoxSizer(tools_box, wx.VERTICAL)
 
-        all_tools = config_mgr.get_all_tool_names()
+        note = wx.StaticText(tools_box, label=(
+            "Tools with associated experiments will be unavailable to the agent "
+            "even if checked here.  The tools checked here are the maximal set "
+            "of tools that may be available to the agent."
+        ))
+        note.Wrap(560)
+        tools_sizer.Add(note, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 10)
+
         self.tool_checks = {}
-        tools_sizer = wx.GridSizer(cols=3, gap=(5, 5))
+        seen = set()
         selected_tools = set(agent.tool_names) if agent else set()
-        for tool_name in all_tools:
-            cb = wx.CheckBox(self, label=tool_name)
-            cb.SetValue(tool_name in selected_tools)
-            cb.Bind(wx.EVT_CHECKBOX, self._on_dirty)
-            self.tool_checks[tool_name] = cb
-            tools_sizer.Add(cb)
-        sizer.Add(tools_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        for group_title, group_tools in config_mgr.get_tool_groups():
+            group_label = wx.StaticText(tools_box, label=group_title)
+            group_label.SetFont(bold_font)
+            tools_sizer.Add(group_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
+            grid = wx.GridSizer(cols=3, gap=(5, 5))
+            for tool_name in group_tools:
+                if tool_name in seen:
+                    continue  # tool_checks keyed by name; no dup checkboxes
+                seen.add(tool_name)
+                cb = wx.CheckBox(tools_box, label=tool_name)
+                cb.SetValue(tool_name in selected_tools)
+                cb.Bind(wx.EVT_CHECKBOX, self._on_dirty)
+                self.tool_checks[tool_name] = cb
+                grid.Add(cb)
+            tools_sizer.Add(grid, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        sizer.Add(tools_sizer, 0, wx.EXPAND | wx.ALL, 10)
 
         # Agent description section
         desc_label = wx.StaticText(self, label="Agent Description:")
-        desc_label.SetFont(font)
+        desc_label.SetFont(bold_font)
         sizer.Add(desc_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
 
         self.desc_ctrl = wx.TextCtrl(
@@ -77,7 +92,7 @@ class AgentTab(wx.Panel):
         if not name:
             wx.MessageBox("Agent name cannot be empty.", "Error", wx.OK | wx.ICON_ERROR)
             return
-        tool_names = [t for t, cb in self.tool_checks.items() if cb.IsChecked()]
+        tool_names = sorted(t for t, cb in self.tool_checks.items() if cb.IsChecked())
         agent_description = self.desc_ctrl.GetValue()
         try:
             self.config_mgr.save_agent(name, tool_names, agent_description)

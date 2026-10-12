@@ -249,6 +249,12 @@ class Conversation:
         self.on_shutdown_starting: Optional[Callable[[], None]] = None  # Called when shutdown begins
         self.on_shutdown_complete: Optional[Callable[[], None]] = None  # Called when shutdown finishes
 
+        # Liveness-transition callback (process_lock.py arm): fired on the
+        # watcher thread when the conversation's alive verdict flips — an
+        # attached Popen exits, an unattached (orphaned) agent is discovered
+        # alive via its io-dir agent lock, or a held lock drops (the orphan
+        # exited). The owning tab marshals the recompute to the GUI thread.
+        self.on_liveness_changed: Optional[Callable[[], None]] = None
         # Reload streaming brackets + completion callback (Phase 2 §6/§7.3).
         self.on_scan_batch_start: Optional[Callable[[], None]] = None
         self.on_scan_batch_end: Optional[Callable[[], None]] = None
@@ -599,6 +605,55 @@ class Conversation:
             return True
         return committed >= size
 
+    def _abandon_unanswered_requests(self, key, pending_request_seqs,
+                                     request_start_times, request_seq):
+        """Fix A (2026-10-10 resume pairing desync): abandon a (fork, turn)'s
+        unanswered request seqs when a new REQUEST row arrives at it.
+
+        The pairing FIFO pushes every REQUEST seq and pops on RESPONSE; a seq
+        whose request never completes (a crashed session's last row, or an
+        aborted in-session retry) stays queued forever. A crash+resume makes
+        this concrete: the reopen replays the dead session's unanswered
+        REQUEST row (the FIFO gains an orphan seq), and the resumed session's
+        first RESPONSE then pops that orphan — pairing every subsequent cycle
+        shifted by one, spawning duplicate contentless response cards while
+        the live request's card (holding the tool expanders) was destroyed by
+        the controller's retry-supersede (the 2026-10-10 02:10 "no tool
+        expanders on the resumed turn" report).
+
+        Safe by protocol (§7.6): one in-flight request per stream with
+        strictly-increasing rows — a second REQUEST row at the same
+        (fork, turn) strictly implies the earlier request will never receive
+        its RESPONSE, so those FIFO entries are dead weight. A live
+        in-flight request is never affected: no second REQUEST row
+        intervenes before its RESPONSE arrives.
+        """
+        fifo = pending_request_seqs.get(key)
+        if not fifo:
+            return
+        abandoned = list(fifo)
+        start_times = [request_start_times.get((key.fork, key.turn, seq))
+                       for seq in abandoned]
+        fifo.clear()
+        # WARNING, not debug: this was THE invisible event behind the
+        # 2026-10-10 report — it must be findable in the conversation log.
+        self.logger.warning(
+            "REQUEST supersedes unanswered request(s): fork=%s turn=%s "
+            "new_seq=%s — abandoned seqs=%s start_times=%s "
+            "(a second REQUEST row at this (fork, turn) means the earlier "
+            "request aborted: crash+resume or retry; its RESPONSE can "
+            "never arrive — one in-flight request per stream, §7.6)",
+            key.fork, key.turn, request_seq, abandoned, start_times)
+
+    def _log_request_pushed(self, key, pending_request_seqs,
+                            fork: int, turn: int, request_seq: int):
+        """Logging plan (2026-10-10 resume-desync diagnosis): the pairing
+        FIFO state after each REQUEST row parse."""
+        self.logger.debug(
+            "request row parsed: fork=%s turn=%s seq=%s pushed; fifo=%s",
+            fork, turn, request_seq,
+            list(pending_request_seqs.get(key, deque())))
+
     def _parse_output_file(self, output_file: Path, fork: int, turn: int,
                             protocol=None, is_conditional=False,
                             conditional_agent_name="", scan_target=None,
@@ -683,9 +738,23 @@ class Conversation:
                         scan_target.request_seq[key] = scan_target.request_seq.get(key, 0) + 1
                         request_seq = scan_target.request_seq[key]
 
+                        # Fix A (2026-10-10 resume-desync — two consecutive
+                        # REQUEST rows head 0.0.out.txt after a crash+resume):
+                        # a new REQUEST row at this (fork, turn) while
+                        # unanswered seqs sit in the pairing FIFO means those
+                        # requests can never be matched (one in-flight request
+                        # per stream, §7.6) — abandon them so this request's
+                        # response pops THIS seq instead of an orphan's.
+                        self._abandon_unanswered_requests(
+                            key, scan_target.pending_request_seqs,
+                            scan_target.request_start_times, request_seq)
+
                         if key not in scan_target.pending_request_seqs:
                             scan_target.pending_request_seqs[key] = deque()
                         scan_target.pending_request_seqs[key].append(request_seq)
+                        self._log_request_pushed(
+                            key, scan_target.pending_request_seqs,
+                            fork, turn, request_seq)
 
                         request_key = (fork, turn, request_seq)
                         scan_target.request_start_times[request_key] = header.start_time
@@ -700,9 +769,25 @@ class Conversation:
                         self._current_request_seq[key] = self._current_request_seq.get(key, 0) + 1
                         request_seq = self._current_request_seq[key]
 
+                        # Fix A (2026-10-10 resume-desync): same pairing
+                        # reset as the conditional namespace above. Pre-fix,
+                        # the reopened GUI replayed the dead session's
+                        # unanswered REQUEST row (the FIFO gained an orphan
+                        # seq), and the resumed session's first RESPONSE then
+                        # popped that orphan — every subsequent cycle spawned
+                        # a duplicate contentless response card while the
+                        # live request's card (holding the tool expanders)
+                        # was destroyed by the controller's retry-supersede.
+                        self._abandon_unanswered_requests(
+                            key, self._pending_request_seqs,
+                            self._request_start_times, request_seq)
+
                         if key not in self._pending_request_seqs:
                             self._pending_request_seqs[key] = deque()
                         self._pending_request_seqs[key].append(request_seq)
+                        self._log_request_pushed(
+                            key, self._pending_request_seqs,
+                            fork, turn, request_seq)
 
                         request_key = (fork, turn, request_seq)
                         self._request_start_times[request_key] = header.start_time
@@ -765,7 +850,6 @@ class Conversation:
         Returns True if this message updated fork/turn state.
         
         """
-        self.logger.debug(f"Processing message: type={header.msg_type}, fork={fork}, turn={turn}")
         updated = False
 
         # Select the appropriate metadata namespace based on is_conditional.
@@ -781,6 +865,19 @@ class Conversation:
             request_start_times = self._request_start_times
             current_request_seq = self._current_request_seq
             turn_metadata = self._turn_metadata
+
+        # Logging plan (2026-10-10 resume-desync diagnosis): every record now
+        # carries its request-pairing scope (the seq counter that
+        # tools/permissions route by + the pending-request FIFO that
+        # responses pop from), so a turn's routing can be traced from the
+        # conversation log alone.
+        ns_key = ForkTurn(fork, turn)
+        self.logger.debug(
+            "Processing message: type=%s, fork=%s, turn=%s, "
+            "current_request_seq=%s, pending_fifo=%s",
+            header.msg_type, fork, turn,
+            current_request_seq.get(ns_key, 0),
+            list(pending_request_seqs.get(ns_key, deque())))
 
         if header.timestamp is None:
             raise ValueError(
@@ -810,6 +907,18 @@ class Conversation:
             request_seq = 0
             if key in pending_request_seqs and len(pending_request_seqs[key]) > 0:
                 request_seq = pending_request_seqs[key].popleft()
+                # Logging plan (2026-10-10 resume-desync): every pairing
+                # decision is now traceable — the 02:10 resumed turn
+                # streamed ~2 cards per request cycle with no diagnostic
+                # trail anywhere in the logs.
+                self.logger.debug(
+                    "response matched request: fork=%s turn=%s seq=%s fifo_remain=%s",
+                    fork, turn, request_seq, list(pending_request_seqs[key]))
+            else:
+                self.logger.warning(
+                    "RESPONSE with empty pending-request queue (orphan response): "
+                    "fork=%s turn=%s — pairing desync: request_seq falls back to 0",
+                    fork, turn)
             request_key = (fork, turn, request_seq) if request_seq > 0 else None
             
             

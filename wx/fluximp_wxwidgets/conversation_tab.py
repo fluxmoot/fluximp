@@ -4,7 +4,8 @@ import wx
 import logging
 import subprocess
 import threading
-from typing import Optional, List, Dict, Tuple
+import time
+from typing import Optional, List, Dict, Tuple, Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -18,6 +19,12 @@ from fluximp_wxwidgets.conditional_sequence import (
     build_conversation_context_messages, apply_offline_terminal_transition,
 )
 from fluximp_agent.conditional_agent import ConditionalAgentConfigInfo
+from fluximp_agent.process_lock import probe as _probe_agent_lock
+from fluximp_protocol.user_agent.fork_turn_state import IOFactKind, IOTurnStatus
+from fluximp_wxwidgets.tab_status_icons import (
+    STATUS_IDLE, STATUS_RUNNING, STATUS_WAITING, STATUS_PAUSED,
+    STATUS_STOPPED, STATUS_ERROR, STATUS_COMPLETED, STATUS_APPROVAL,
+)
 
 
 
@@ -51,6 +58,22 @@ class ConversationTab(wx.Panel):
         self._stop_pressed: bool = False  # True after Stop pressed, reset on new process
         self._closed: bool = False  # Set to True when tab is closed/destroyed
 
+        # Spawn window (Option 2e): True between the Send-driven spawn and
+        # the process attach, so the header reads 'running' immediately.
+        self._process_starting: bool = False
+        # Tab-header status icon (Option F). on_status_changed is wired by
+        # the main frame to its notebook-bitmap updater; _last_reported_status
+        # dedupes those updates; _last_terminal carries the most recent turn
+        # outcome so a dead agent's icon can read error/completed.
+        self.on_status_changed: Optional[Callable[[], None]] = None
+        self._last_reported_status: Optional[str] = None
+        self._last_terminal: Optional[str] = None
+
+        # Liveness probe verdict cache (tab-local, GUI thread):
+        # (verdict, monotonic timestamp). Render recomputes reuse the
+        # cache; click handlers re-probe with force=True so no action
+        # ever acts on a stale verdict (process_lock.py).
+        self._alive_probe: Tuple[str, Optional[float]] = ('free', None)
         # The view fork is now derived from fork_turn_state.latest_fork at each
         # use site; the next turn is computed from fork_turn_state.next_turn().
         # (No stored _view_fork / _next_turn state.)
@@ -76,15 +99,15 @@ class ConversationTab(wx.Panel):
         self.history_view = WorkflowHistoryView(self, logger=self.conversation.logger)
         main_sizer.Add(self.history_view, 1, wx.EXPAND | wx.ALL, 5)
 
-        # Footer container: input area + position label, hidden during reload
-        # and replaced by the reload status line (§5.10.1).
+        # Footer container: input area, hidden during reload and replaced by
+        # the position status line (§5.10.1).
         self.footer_panel = wx.Panel(self)
         footer_sizer = wx.BoxSizer(wx.VERTICAL)
 
         # Input area
         input_sizer = wx.BoxSizer(wx.HORIZONTAL)
 
-        self.input_ctrl = wx.TextCtrl(self.footer_panel, style=wx.TE_MULTILINE, size=(-1, 60))
+        self.input_ctrl = wx.TextCtrl(self.footer_panel, style=wx.TE_MULTILINE, size=(-1, 85))
         self.input_ctrl.SetHint(self._INPUT_HINT_ENABLED)
         self.input_ctrl.Bind(wx.EVT_KEY_DOWN, self._on_input_key)
         input_sizer.Add(self.input_ctrl, 1, wx.EXPAND | wx.RIGHT, 5)
@@ -120,17 +143,15 @@ class ConversationTab(wx.Panel):
 
         footer_sizer.Add(input_sizer, 0, wx.EXPAND | wx.ALL, 5)
 
-        # Fork/Turn indicator
-        self.position_label = wx.StaticText(self.footer_panel, label="Fork 0, Turn 0")
-        footer_sizer.Add(self.position_label, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
-
         self.footer_panel.SetSizer(footer_sizer)
         main_sizer.Add(self.footer_panel, 0, wx.EXPAND)
 
-        # Reload status line (shown only while a reload streams, §5.10.1).
-        self.reload_status_label = wx.StaticText(self, label="Loading history...")
-        self.reload_status_label.Hide()
-        main_sizer.Add(self.reload_status_label, 0, wx.EXPAND | wx.ALL, 5)
+        # Position status line (shown only while a reload streams, §5.10.1):
+        # replaces the footer's input/button UI during the load and is hidden
+        # again once the footer is restored.
+        self.position_label = wx.StaticText(self, label="Viewing Fork 0")
+        self.position_label.Hide()
+        main_sizer.Add(self.position_label, 0, wx.EXPAND | wx.ALL, 5)
 
         self.SetSizer(main_sizer)
 
@@ -161,6 +182,12 @@ class ConversationTab(wx.Panel):
         self.conversation.on_error = self._on_error
         self.conversation.on_shutdown_starting = self._on_shutdown_starting
         self.conversation.on_shutdown_complete = self._on_shutdown_complete
+
+        # Liveness-transition callback (process_lock.py arm): the watcher
+        # thread fires it when the alive verdict flips (attached Popen
+        # exit, orphan discovered alive, or a held lock dropped). The
+        # handler marshals the recompute to the GUI thread.
+        self.conversation.on_liveness_changed = self._on_liveness_changed
 
         # Displayed-tab-only right-panel forwards. The shared panel used to
         # bind these per-conversation slots itself: the callbacks carried no
@@ -199,7 +226,7 @@ class ConversationTab(wx.Panel):
         # conversations settle via the empty short-circuit, reopened ones at
         # finalization (§7.4 step 9).
         self.footer_panel.Hide()
-        self.reload_status_label.Show()
+        self.position_label.Show()
 
         # Reload batch buffer (§8.5): set on the watcher thread by
         # _on_scan_batch_start; watcher callbacks buffer their events into it
@@ -226,11 +253,28 @@ class ConversationTab(wx.Panel):
             # Process has exited, clear it
             self.conversation.process = None
 
+        # Absorbed-orphan guard (process_lock.py): an unattached agent (a
+        # previous GUI session's process) holds the io dir's agent lock.
+        # A second process on one io dir would race input files and
+        # duplicate expensive turns (the agent-side lock would fail the
+        # spawn too). Absorb: no spawn, no notify; the watcher's
+        # held-lock arm keeps scanning the orphan's records and the input
+        # written here is read by the holder's existing input handles.
+        if self._probe_orphan_alive(force=True):
+            self.conversation.logger.info(
+                "ensure_process_running: unattached agent holds the io dir "
+                "lock; absorbing (no new process started)")
+            return True
         # Notify that process is starting (disables config controls in UI)
         # This runs on main thread since we're called from button click handler
         if self.conversation.on_process_starting:
             self.conversation.on_process_starting()
 
+        # Spawn window (Option 2e): the status derivation reads this as
+        # alive-ish so the first Send shows 'running' immediately rather
+        # than a transient idle before the process attaches.  Cleared on
+        # attach (or spawn failure) in _start_process_in_background.
+        self._process_starting = True
         # Start process in background thread to keep UI responsive
         # This handles shutdown wait, clearing end signals, and process startup
         import threading
@@ -272,12 +316,18 @@ class ConversationTab(wx.Panel):
             # Reset _agent_active so Send is enabled and Stop appears.
             self._agent_active = False
             self._notify_agent_active_state()
-            wx.CallAfter(self._update_button_states)
         except Exception as e:
             self.conversation.logger.error(f"Failed to start process: {e}")
             self._agent_active = False
             self._stop_pressed = False
             self._notify_agent_active_state()
+        finally:
+            # Spawn window (Option 2e): close it on every exit — attach
+            # success, spawn failure, or the early return above waiting on a
+            # shutdown — so the header status can never stick on the
+            # alive-ish 'running'/'waiting' icon after a spawn that never
+            # produced a process.
+            self._process_starting = False
             wx.CallAfter(self._update_button_states)
 
     def _is_any_agent_active(self) -> bool:
@@ -313,6 +363,85 @@ class ConversationTab(wx.Panel):
             return self.send_btn.IsEnabled()
         except RuntimeError:
             return False
+
+    def get_restart_available(self) -> bool:
+        """True when some control actually restarts the agent process.
+
+        The right panel's stopped-status phrasing only promises "will
+        restart on next send" when this is True: Send enabled (a send
+        respawns through _ensure_process_running) or Resume visible (the
+        resume restarts). A stopped non-resumable workflow has neither
+        (§7.8) — for that shape the panel shows the plain stopped form
+        and promises nothing.
+        """
+        if not self._is_window_valid():
+            return False
+        try:
+            return self.send_btn.IsEnabled() or self.resume_btn.IsShown()
+        except RuntimeError:
+            return False
+
+    def get_status(self, alive: Optional[bool] = None) -> str:
+        """Derive this tab's header-status icon key (Option 2e).
+
+        One ordered derivation over an explicit signal set, shape-first
+        (colour-blind safe).  Precedence, highest first:
+
+          1. invalid window                     -> idle
+          2. alive/starting + pending approval  -> approval
+          3. alive/starting + turn in flight    -> running
+          4. alive/starting                     -> waiting (idle, your move)
+          5. non-resumable                      -> stopped
+          6. terminal error                     -> error
+          7. terminal completed (with messages) -> completed
+          8. messages                           -> paused
+          9. otherwise                          -> idle
+
+        *alive* is an optional pre-computed verdict so the central recompute
+        does not probe twice.  "Alive-ish" folds in the spawn window so the
+        first Send reads running immediately instead of a transient idle.
+        """
+        if not self._is_window_valid():
+            return STATUS_IDLE
+        if alive is None:
+            alive = self._is_agent_alive()
+        alive_ish = alive or self._process_starting
+        if alive_ish:
+            fork, turn = self.conversation.fork_turn_state.active_position
+            if self.history_controller.has_pending_permission(fork, turn):
+                return STATUS_APPROVAL
+            if self._turn_in_flight():
+                return STATUS_RUNNING
+            return STATUS_WAITING
+        if self.history_controller.non_resumable:
+            return STATUS_STOPPED
+        if self._last_terminal == STATUS_ERROR:
+            return STATUS_ERROR
+        if self._last_terminal == STATUS_COMPLETED and self.conversation.messages:
+            return STATUS_COMPLETED
+        if self.conversation.messages:
+            return STATUS_PAUSED
+        return STATUS_IDLE
+
+    def _notify_status_changed(self, alive: Optional[bool] = None):
+        """Fire on_status_changed when the derived status actually changes.
+
+        Called from _update_button_states (the central recompute) and from
+        the non-resumable settle, so the frame's tab-header icon tracks
+        every state transition.  The dedupe keeps the notebook repaint to
+        real changes only.
+        """
+        cb = self.on_status_changed
+        if cb is None:
+            return
+        try:
+            status = self.get_status(alive)
+        except Exception:
+            return
+        if status == self._last_reported_status:
+            return
+        self._last_reported_status = status
+        cb()
 
     def _panel_displays(self) -> bool:
         """True when the shared right panel currently displays this tab.
@@ -371,17 +500,116 @@ class ConversationTab(wx.Panel):
             return False
         return self.conversation.process.poll() is None
 
+    def _probe_orphan_alive(self, force: bool = False) -> bool:
+        """Lock-probe the conversation's io dir: True when an unattached
+        agent (an orphan from a previous GUI session) holds its liveness
+        lock (process_lock.py).
+
+        Verdicts are cached briefly (a probe is a flock attempt / mutex
+        syscall) for render-time recomputes; click handlers pass
+        force=True so no action ever acts on a stale verdict. 'unknown'
+        (probe failure) is never alive — behavior degrades to the
+        attached-Popen-only semantics of the pre-lock era.
+        """
+        cached_ts = self._alive_probe[1]
+        if (not force and cached_ts is not None
+                and time.monotonic() - cached_ts < 0.5):
+            return self._alive_probe[0] == 'held'
+        try:
+            verdict = _probe_agent_lock(self.conversation.io_dir, 'agent')
+        except Exception:
+            verdict = 'unknown'
+        self._alive_probe = (verdict, time.monotonic())
+        return verdict == 'held'
+
+    def _is_agent_alive(self) -> bool:
+        """True when the workflow agent is alive: the attached Popen (this
+        GUI spawned it) OR an unattached lock holder (an orphaned agent
+        absorbed at reopen). The single aliveness truth Stop/Resume key on.
+        """
+        if self.conversation.process is not None:
+            if self.conversation.process.poll() is None:
+                return True
+        return self._probe_orphan_alive()
+
+    def _orphan_turn_in_flight(self) -> bool:
+        """Re-derive mid-turn state from io facts for an unattached
+        (orphan) agent's Stop routing — facts, not the replayed
+        _agent_active flag, because the orphan's streams may hold records
+        this GUI never parsed and the flag can be stale in either
+        direction.
+
+        The active position's turn is in flight when it has input and its
+        output stream is non-terminal (parsed but no terminal record yet —
+        e.g. a REQUEST whose turn was never completed or acked).
+        """
+        state = self.conversation.fork_turn_state
+        fork, turn = state.active_position
+        facts = state.facts
+        has_input = any(
+            f.kind is IOFactKind.IN and f.fork == fork and f.turn == turn
+            for f in facts)
+        if not has_input:
+            # No input at the active position: the (live) holder is idle
+            # at a turn boundary — the .end route reaches it at its poll
+            # position; cancel_turn would have nowhere ack-able to land.
+            return False
+        out_status = next(
+            (f.status for f in facts
+             if f.kind is IOFactKind.OUT
+             and f.fork == fork and f.turn == turn),
+            None)
+        if out_status is None:
+            # Input posted but no output stream yet (the holder has not
+            # begun writing the turn): in flight — cancel_turn is the
+            # route that can still reach the agent at that position.
+            return True
+        return out_status not in (IOTurnStatus.COMPLETE_NORMAL,
+                                  IOTurnStatus.COMPLETE_ERROR,
+                                  IOTurnStatus.CANCELLED,
+                                  IOTurnStatus.ABANDONED)
+
+    def _turn_in_flight(self) -> bool:
+        """True when a turn is in flight for the header status (Option 2e).
+
+        Facts-based, not the _agent_active busy flag: the active position has
+        an input whose output stream is not yet terminal (reusing the orphan
+        Stop-routing predicate), or a conditional run is live.  Because
+        Conversation.send_message records the IN fact synchronously, this is
+        true the instant Send is pressed — no watcher-scan lag, and no
+        dependence on the spawn thread's _agent_active reset.
+        """
+        return (self._orphan_turn_in_flight()
+                or len(self._conditional_subprocesses) > 0)
+
+    def _on_liveness_changed(self):
+        """Watcher-thread callback: the conversation's alive verdict flipped
+        (an attached Popen exited, an unattached agent was discovered
+        alive, or a held lock dropped — the orphan exited). Marshal the
+        button/status recompute to the GUI thread.
+        """
+        wx.CallAfter(self._safe_ui, self._on_liveness_changed_ui)
+
+    def _on_liveness_changed_ui(self):
+        """GUI thread: settle buttons to the new aliveness truth.
+
+        _update_button_states forwards the displayed shared panel's
+        status/config state, so the label refresh rides along.
+        """
+        self._update_button_states()
+
     def _update_button_states(self):
         """Centralized method to update Stop, Resume, and Send button states.
 
         Should be called (via wx.CallAfter from background threads, or directly
         from UI thread handlers) at every state transition.
 
-        Stop:    Visible if process is running and Stop hasn't been pressed,
+        Stop:    Visible if the agent process is alive (attached Popen or an
+                 unattached lock-held orphan) and Stop hasn't been pressed,
                  or a conditional run is live (§7.7 — Stop routes to the run).
-        Resume:  Visible if process is not running, there are messages, and
-                 no agent is active — or a Stop-parked conditional run awaits
-                 Resume (§7.7).
+        Resume:  Visible if the agent process is not alive and there are
+                 messages — or a Stop-parked conditional run awaits Resume
+                 (§7.7). A non-resumable workflow never shows it (§7.8).
         Send:    Enabled if no agent is active and no §7.7 sequence lock holds
                  the surface; disabled entirely on a non-resumable workflow.
         Input:   The input box mirrors Send exactly — disabled whenever Send
@@ -394,20 +622,33 @@ class ConversationTab(wx.Panel):
         if not self._is_window_valid():
             return
 
-        # Stop button: visible while process is running (unless already
-        # pressed), or while a conditional run is live (§7.7).
-        show_stop = (self._is_process_running() and not self._stop_pressed
+        # Aliveness truth (process_lock.py): the attached Popen (this
+        # GUI's spawn) or an unattached agent holding the io dir's lock
+        # (an orphaned agent from a previous GUI session, absorbed at
+        # reopen). Stop/Resume visibility keys on this — NOT the
+        # _agent_active busy flag, which now only gates the Send/Input
+        # pair and Stop's cancel-vs-idle routing (a turn-protocol
+        # concern: one user input per active turn).
+        alive = self._is_agent_alive()
+
+        # Stop button: visible while the agent is alive (unless already
+        # pressed), or while a conditional run is live (§7.7 — Stop routes
+        # to the run).
+        show_stop = (alive and not self._stop_pressed
                      or len(self._conditional_subprocesses) > 0)
         self.stop_btn.Show(show_stop)
 
-        # Resume button: visible when process is not running and there are
-        # messages to resume and no agent is actively starting/running —
-        # plus a Stop-parked conditional run awaiting Resume (§7.7).
-        show_resume = (not self._is_process_running()
+        # Resume button: visible when the agent is not alive and there
+        # are messages — plus a Stop-parked conditional run awaiting
+        # Resume (§7.7). A non-resumable workflow never shows Resume
+        # (§7.8: _on_resume refuses the click for the same reason, so the
+        # rendered-but-refused quirk is gone).
+        show_resume = (not alive
                        and bool(self.conversation.messages)
-                       and not self._agent_active
                        and len(self._conditional_subprocesses) == 0)
         show_resume = show_resume or self._stopped_sequence_event_key is not None
+        if self.history_controller.non_resumable:
+            show_resume = False
         self.resume_btn.Show(show_resume)
 
         # Send button: enabled when no agent is active and no §7.7 sequence
@@ -430,6 +671,9 @@ class ConversationTab(wx.Panel):
         self._notify_panel_config_state(send_enabled)
 
         self.Layout()
+        # Header status icon (Option F): the central recompute is the single
+        # site that fires the frame's tab-bitmap update on a real change.
+        self._notify_status_changed(alive)
 
     def _apply_input_enable(self, enabled: bool):
         """Set the input box's enabled state and its matching grey hint.
@@ -502,7 +746,7 @@ class ConversationTab(wx.Panel):
         if not self._is_window_valid():
             return
         self.footer_panel.Hide()
-        self.reload_status_label.Show()
+        self.position_label.Show()
         self.Layout()
 
     def exit_reload_status_mode(self):
@@ -510,7 +754,7 @@ class ConversationTab(wx.Panel):
         if not self._is_window_valid():
             return
         self.footer_panel.Show()
-        self.reload_status_label.Hide()
+        self.position_label.Hide()
         self.Layout()
 
     def _on_scan_batch_start(self):
@@ -542,6 +786,13 @@ class ConversationTab(wx.Panel):
         if conversation is not None:
             facts = conversation._reload_fact_buffer
             conversation._reload_fact_buffer = []
+        # Logging plan (2026-10-10 resume-desync diagnosis): one DEBUG line per
+        # reload tick — the buffered backlog counts are now answerable from
+        # the log alone.
+        if conversation is not None:
+            conversation.logger.debug(
+                "reload scan batch end: buffered_events=%s buffered_facts=%s",
+                len(buffer), len(facts) if facts else 0)
         # Chunk the replay so the GUI thread yields to paints between chunks
         # (§8.5); finalize_reload defers itself until _reload_replay_pending
         # drains.
@@ -591,6 +842,15 @@ class ConversationTab(wx.Panel):
         finally:
             controller.end_batch()
             self._reload_replay_pending -= 1
+        # Logging plan (2026-10-10 resume-desync diagnosis): per-chunk replay
+        # counts (GUI thread) — what the backlog replay actually processed,
+        # answerable from the log alone.
+        if self.conversation is not None:
+            self.conversation.logger.debug(
+                "reload replay chunk: replayed=%s start=%s total=%s "
+                "chunks_pending=%s",
+                min(self.RELOAD_REPLAY_CHUNK, len(events) - start),
+                start, len(events), self._reload_replay_pending)
         end = start + self.RELOAD_REPLAY_CHUNK
         if end < len(events):
             wx.CallAfter(self._safe_ui, self._replay_reload_batch, events, end)
@@ -682,17 +942,51 @@ class ConversationTab(wx.Panel):
         # otherwise cluster roles on reopen.
         self.history_controller.reorder_items_chronologically()
 
-        # Step 4: static pending for pending cards (no running process).
+        # Step 4: settle pending cards. With no live agent they render
+        # static (no timer runs against a card that will never resolve);
+        # an unattached-but-alive orphan (lock held, process_lock.py)
+        # keeps the live timer — its response may still land through the
+        # watcher's held-lock scan arm.
+        live_agent = self._is_agent_alive()
         for item in self.history_controller._items:
             if item.item_id.kind != 'card' or not item.pending:
                 continue
             card = self.history_controller._widget(item)
-            if card is not None and hasattr(card, 'set_static_pending'):
-                try:
+            if card is None:
+                continue
+            try:
+                if live_agent and hasattr(card, 'set_pending'):
+                    card.set_pending()
+                elif hasattr(card, 'set_static_pending'):
                     card.set_static_pending()
-                except RuntimeError:
-                    pass
+            except RuntimeError:
+                pass
 
+        # Logging plan (2026-10-10 resume-desync diagnosis): one summary line at
+        # caught-up. A non-empty unanswered-request FIFO here with no live
+        # process is exactly the crash+resume state that desynced the
+        # 2026-10-10 resumed turn (reported "no tool expanders") — it is
+        # visible on one line at reload time now. Diagnostics must never
+        # break finalization, hence the guard.
+        try:
+            _pending_cards = sum(
+                1 for it in self.history_controller._items
+                if it.item_id.kind == 'card' and it.pending)
+            _fifo = {}
+            for k, seqs in conversation._pending_request_seqs.items():
+                if seqs:
+                    _fifo[f"{k.fork}.{k.turn}"] = list(seqs)
+            for target in conversation._conditional_scan_targets.values():
+                for k, seqs in target.pending_request_seqs.items():
+                    if seqs:
+                        _fifo[f"{target.agent_name}:{k.fork}.{k.turn}"] = list(seqs)
+            conversation.logger.info(
+                "reload finalize summary: items=%s pending_cards=%s "
+                "unanswered_request_fifos=%s live_agent=%s",
+                len(self.history_controller._items), _pending_cards,
+                _fifo, live_agent)
+        except Exception:
+            pass
         # Step 5: chunked measure-all (§7.4). Every item's exact height is
         # populated before `_end_load()` makes the end-of-load scroll choice;
         # the continuation (steps 6-9) runs once the pass completes.
@@ -740,6 +1034,21 @@ class ConversationTab(wx.Panel):
             self.conversation.on_fork_turn_update()
         if self.history_controller.non_resumable:
             return
+        # Reload un-wedge self-heal (process_lock.py): a replayed REQUEST
+        # can leave _agent_active stuck True when the turn's terminal
+        # record was written after the old GUI died and never parsed by
+        # this one. With no attached process and nothing alive-by-lock,
+        # re-derive from disk: a provably terminal active turn releases
+        # the busy flag so Send unlocks without a Resume click (a
+        # non-terminal turn keeps the busy gate — Resume as mid-turn
+        # recovery is that path, and the aliveness-keyed button rule
+        # already shows it).
+        if (self._agent_active
+                and self.conversation.process is None
+                and not self._probe_orphan_alive(force=True)):
+            fork, turn = self.conversation.fork_turn_state.active_position
+            if self.history_controller.is_turn_terminal(fork, turn):
+                self._agent_active = False
         self.history_controller.restore_live_permissions()
         self._update_position()
         self._update_button_states()
@@ -765,6 +1074,11 @@ class ConversationTab(wx.Panel):
         # widget-touching controller calls are marshalled to the GUI thread.
         wx.CallAfter(self._safe_ui, self.history_controller.on_message, message)
 
+        # A permission request means the agent is blocked on the user: nudge
+        # the header status to 'approval' once the routing above has
+        # registered the pending marker (queued after it, Option 2e).
+        if message.role == 'permission_request':
+            wx.CallAfter(self._safe_ui, self._notify_status_changed)
         # §7.7: mark the run's terminal record consumed on the GUI thread in
         # the same branch that routes a run_terminal=True message for the run
         # (the timer's O(1) deferral gate).
@@ -810,6 +1124,7 @@ class ConversationTab(wx.Panel):
     def _on_turn_complete(self, fork: int, turn: int):
         """Called when a turn completes."""
         self._agent_active = False
+        self._last_terminal = STATUS_COMPLETED
         self._notify_agent_active_state()
         if not self._reload_streaming():
             wx.CallAfter(self._update_button_states)
@@ -839,6 +1154,13 @@ class ConversationTab(wx.Panel):
             approved,
             explanation
         )
+        # The agent resumes on the same turn, so the turn's terminal events
+        # will not clear the pending-permission marker; clear it here so the
+        # header icon leaves 'approval' the moment the user answers
+        # (Option 2e).
+        self.history_controller.mark_permission_answered(
+            permission_message.fork, permission_message.turn)
+        self._notify_status_changed()
         # Wake the file watcher so the permission response renders on an
         # immediately woken tick (§5.10).
         if self.file_watcher:
@@ -852,6 +1174,7 @@ class ConversationTab(wx.Panel):
     def _on_error(self, fork: int, turn: int, error_message: str):
         """Called when a turn errors (e.g., max requests reached)."""
         self._agent_active = False
+        self._last_terminal = STATUS_ERROR
         self._notify_agent_active_state()
         if not self._reload_streaming():
             wx.CallAfter(self._update_button_states)
@@ -866,7 +1189,7 @@ class ConversationTab(wx.Panel):
 
     def _on_fork_turn_update(self):
         """Called when fork/turn data updates."""
-        # The position label is in the footer, hidden during a reload;
+        # The position status line is shown only while a reload streams;
         # finalization recomputes it once (§7.4 step 9).
         if self._reload_batch_buffer is not None:
             return
@@ -898,6 +1221,7 @@ class ConversationTab(wx.Panel):
         if not is_conditional:
             self._agent_active = True
             self._stop_pressed = False
+            self._last_terminal = None
             self._notify_agent_active_state()
             if not self._reload_streaming():
                 wx.CallAfter(self._update_button_states)
@@ -942,6 +1266,7 @@ class ConversationTab(wx.Panel):
     def _on_cancel_ack(self, fork: int, turn: int):
         """Called when the agent acknowledges the cancel request."""
         self._agent_active = False
+        self._last_terminal = None
         self._notify_agent_active_state()
         if not self._reload_streaming():
             wx.CallAfter(self._update_button_states)
@@ -996,28 +1321,74 @@ class ConversationTab(wx.Panel):
         self._notify_panel_config_state(False)
         self.Layout()
 
-        if was_active:
-            # Agent is actively processing - send cancel_turn message.
-            # _on_cancel_ack will fire when the agent acknowledges.
-            self.conversation.cancel_current_turn()
+        if self.conversation.process is not None:
+            if was_active:
+                # Agent is actively processing - send cancel_turn message.
+                # _on_cancel_ack will fire when the agent acknowledges.
+                self.conversation.cancel_current_turn()
+            else:
+                # Agent is idle between turns - terminate process directly.
+                # _on_shutdown_complete will fire when the process has exited.
+                self.conversation.terminate()
         else:
-            # Agent is idle between turns - terminate process directly.
-            # _on_shutdown_complete will fire when the process has exited.
-            self.conversation.terminate()
+            # Unattached but alive (Stop is aliveness-keyed, process_lock.py):
+            # an orphaned agent from a previous GUI session owns the io dir,
+            # and its records stream through the watcher's held-lock arm. No
+            # Popen exists, so there is no escalation ladder — the graceful
+            # input-stream routes are the Stop semantics for an orphan (an
+            # expensive in-flight API call is never killed on the way out),
+            # and the ack / lock-drop settles the buttons through the
+            # liveness-transition callback.
+            if self._orphan_turn_in_flight():
+                # Mid-turn: write cancel_turn — the agent acks when the
+                # in-flight call returns and exits. A stale second cancel
+                # is drained by mid-turn recovery on the next start.
+                self.conversation.cancel_current_turn()
+            else:
+                # Idle at a turn boundary: write the .end at the agent's
+                # poll position so it exits quietly within one ~50ms poll
+                # (clear_end_signal removes the leftover on next launch).
+                self.conversation.end_conversation()
 
     def _on_resume(self, event: wx.Event):
         """Handle resume button click - restart the agent process."""
         if self.history_controller.non_resumable:
             # §7.8: no event reaches the engine on a non-resumable workflow.
             return
+        # Logging plan (2026-10-10 resume-desync diagnosis): Resume was
+        # completely unlogged while the resumed turn's pairing desync streamed
+        # ~2 cards per request cycle — the press and the branch it takes must
+        # be answerable from the conversation log.
         if self._stopped_sequence_event_key is not None:
             # §7.7 park-on-stop: Resume relaunches the Stop-parked conditional
             # run's current step with a fresh run_id/run dir.
+            self.conversation.logger.info(
+                "Resume pressed: relaunching Stop-parked conditional "
+                "sequence (event_key=%s)", self._stopped_sequence_event_key)
             self._resume_stopped_conditional()
+            return
+        if self._probe_orphan_alive(force=True):
+            # Action-time re-probe (process_lock.py): an unattached agent
+            # came to own the io dir since the button rendered (the
+            # liveness transition may not have re-rendered yet). Nothing
+            # to start — the watcher's held-lock arm is already streaming
+            # its records; settle the controls to the live truth. A second
+            # process on one io dir would race inputs and duplicate
+            # expensive turns (the agent-side lock would fail it too).
+            self.conversation.logger.info(
+                "Resume pressed: orphaned agent alive by lock — settling "
+                "controls to the live agent (no relaunch)")
+            self._update_button_states()
             return
         # Restart the agent process. _ensure_process_running() handles dead
         # Popen cleanup, end signal clearing, and process startup.
+        self.conversation.logger.info(
+            "Resume pressed: relaunching agent process (conversation_id=%s "
+            "io_dir=%s)", self.conversation.conversation_id,
+            self.conversation.io_dir)
         if not self._ensure_process_running():
+            self.conversation.logger.warning(
+                "Resume failed: could not start the agent process")
             wx.MessageBox(
                 "Failed to resume dev workflow. Please try again.",
                 "Resume Error",
@@ -1372,6 +1743,12 @@ class ConversationTab(wx.Panel):
         if not self._conditional_event_key:
             return
 
+        # Logging plan (2026-10-10 resume-desync diagnosis): the Resume Sequence
+        # press was previously completely unlogged.
+        self.conversation.logger.info(
+            "Resume Sequence pressed: re-firing event_key=%s provider=%s "
+            "model=%s", self._conditional_event_key,
+            self.conversation.current_provider, self.conversation.current_model)
         conversation_messages = build_conversation_context_messages(
             self.conversation.messages,
             self.conversation.fork_turn_state)
@@ -1461,10 +1838,11 @@ class ConversationTab(wx.Panel):
         if not self._is_window_valid():
             return
         self.footer_panel.Hide()
-        self.reload_status_label.SetLabel(
+        self.position_label.SetLabel(
             "Read-only: sequence state could not be loaded")
-        self.reload_status_label.Show()
+        self.position_label.Show()
         self.Layout()
+        self._notify_status_changed()
 
     def _has_sequence_lock(self) -> bool:
         """True when the input/Send surface must stay locked.
@@ -1552,6 +1930,12 @@ class ConversationTab(wx.Panel):
         event_key = self._stopped_sequence_event_key
         if event_key is None:
             return
+        # Logging plan (2026-10-10 resume-desync diagnosis): this resume branch
+        # relaunches a Stop-parked conditional step — the action must be
+        # answerable from the conversation log.
+        self.conversation.logger.info(
+            "Resume (stopped conditional): relaunching Stop-parked sequence "
+            "step event_key=%s", event_key)
         if self._config_mgr is not None and not self._conditional_agent_list:
             workflow_name = self.conversation.workflow_name
             agent_names = self._config_mgr.get_event_sequence_for_agent_type(
@@ -1739,8 +2123,14 @@ class ConversationTab(wx.Panel):
             if io_dir_str:
                 run_dir = Path(io_dir_str)
             else:
-                # Fall back to the io tree discovery for the run dir.
-                run_dir = self.conversation.io_dir / f"conditional_{run_id}"
+                # Fall back to io-tree discovery: run dirs are minted as
+                # conditional_{agent}_{run_id} (conditional_sequence.py's
+                # _launch_agent_subprocess), so glob on the run_id suffix —
+                # the plain conditional_{run_id} name never matches.
+                matches = sorted(
+                    self.conversation.io_dir.glob(f"conditional_*_{run_id}"))
+                if matches and matches[0].is_dir():
+                    run_dir = matches[0]
         # 1. Stream terminal marker in the run's own scan (content wins).
         if run_id:
             terminal = None
@@ -1789,9 +2179,42 @@ class ConversationTab(wx.Panel):
             except Exception:
                 pass
             return
-        # 3. Crash / no marker, no tombstone: stay parked with the lock engaged.
-        # The §7.7 restart rule engages the input/Send lock while ANY loaded
-        # chain is running; finalization neither relabels nor unlocks.
+        # 3. No terminal marker, no tombstone: probe the run dir's agent
+        # lock (process_lock.py) before parking the chain.
+        if run_dir is not None:
+            verdict = _probe_agent_lock(run_dir, 'agent')
+            if verdict == 'held':
+                # Still alive: the run's agent survived the GUI exit and
+                # owns its run dir (a fresh launch here would also fail the
+                # agent-side single-owner lock). Keep the park exactly as
+                # the pre-lock rule did — the watcher's held-lock arm
+                # streams the run's records, and the terminal marker
+                # resolves the chain on a later reopen (branch 1).
+                self.conversation.logger.info(
+                    f"conditional run {run_id} for {event_key} is still "
+                    f"alive (run-dir lock held); keeping parked lock")
+                return
+            if verdict == 'free':
+                # Dead with the GUI (crash or kill): the run will never
+                # write again. Resolve like the killed-at-close relabel
+                # (branch 2) so the §7.7 input/Send lock cannot hold
+                # forever on a process that no longer exists.
+                try:
+                    loaded = load_state(
+                        self.conversation.conversation_dir, event_key)
+                    if loaded is not None:
+                        loaded.status = "waiting_for_user"
+                        save_state(self.conversation.conversation_dir, loaded)
+                        self.history_controller.resolve_loaded_sequence_state(
+                            event_key, loaded)
+                except Exception as e:
+                    self.conversation.logger.error(
+                        f"liveness relabel failed for {event_key}: {e}")
+                return
+        # 'unknown' (probe failure) or an unresolvable run dir: stay
+        # parked with the lock engaged (conservative — the §7.7 restart
+        # rule keeps the input/Send lock while ANY loaded chain is
+        # running); a later reopen re-probes.
         return
 
     def _agent_name_for_run_id(self, run_id: str) -> str:
@@ -1874,6 +2297,7 @@ class ConversationTab(wx.Panel):
         self.conversation.on_process_attached = None
         self.conversation.on_process_starting = None
 
+        self.conversation.on_liveness_changed = None
         # Terminate the agent process in a background thread. terminate()
         # blocks for up to ~9s (graceful wait -> SIGTERM -> SIGKILL). Running
         # it synchronously here freezes the wx event loop, during which the

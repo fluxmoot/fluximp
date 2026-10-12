@@ -7,7 +7,11 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional, Callable, Dict, List, Any
 
-from fluximp_wxwidgets.collapsible_section import CollapsibleSection
+from fluximp_wxwidgets.collapsible_section import (
+    CollapsibleSection,
+    _WidgetLoggerProxy,
+    _WIDGET_TRACE,
+)
 from fluximp_protocol.user_agent.file_io.defs import parse_utc_timestamp
 from fluximp_wxwidgets.conversation_manager import ConversationMessage, PermissionRequest
 
@@ -27,7 +31,14 @@ class RequestCard(wx.Panel):
                  system_agent_type: str = "",
                  logger: Optional[logging.Logger] = None,
                  pos=wx.DefaultPosition):
-        self._logger = logger or logging.getLogger(__name__)
+        # Logging plan (2026-10-10 resume-desync diagnosis): the card's ~15
+        # per-step DEBUG lines are silenced by default (debug-dropping
+        # proxy — INFO and above pass through) and ONE INFO identity line
+        # per card replaces them. Set FLUXIMP_WIDGET_TRACE=1 to restore the
+        # raw logger and the per-step trace for a specific repro.
+        base_logger = logger or logging.getLogger(__name__)
+        self._logger = (base_logger if _WIDGET_TRACE
+                        else _WidgetLoggerProxy(base_logger))
         self._logger.debug('RequestCard.__init__: START fork=%s, turn=%s', fork, turn)
         super().__init__(parent, pos=pos)
         self._logger.debug('RequestCard.__init__: super() done')
@@ -57,8 +68,18 @@ class RequestCard(wx.Panel):
         
         # System agent subcard tracking (for scrutinator etc.)
         self._system_agent_subcards: Dict[str, Dict] = {}
-        self._logger.debug('RequestCard.__init__: calling _build_ui')
         self._build_ui()
+        # Logging plan (2026-10-10 resume-desync diagnosis): ONE identity
+        # line per card replaces the per-step debug trace — request_seq is
+        # the pairing key the desync scrambled, and id() disambiguates the
+        # same-label cards it doubled.
+        self._logger.info(
+            'RequestCard: created id=%s fork=%s turn=%s request_seq=%s '
+            'conditional=%s agent=%r system=%r',
+            id(self), self._fork, self._turn,
+            self._metadata.get('request_seq'),
+            self.is_conditional, self.conditional_agent_name,
+            self.system_agent_type)
         self._logger.debug('RequestCard.__init__: COMPLETE')
 
     def _build_ui(self):

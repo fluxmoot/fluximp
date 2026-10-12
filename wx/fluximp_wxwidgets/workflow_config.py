@@ -13,7 +13,7 @@ directly to main.py.
 import json
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 
 from fluximp_agent import fs_agents
 from fluximp_agent.conditional_agent import ConditionalAgentConfigInfo
@@ -89,9 +89,16 @@ class AgentConfigInfo:
 STOCK_WORKFLOW_NAME = "Dev Workflow"
 STOCK_WORKFLOW_AGENTS = sorted(fs_agents.AGENT_DEFINITIONS.keys())
 
-ALL_TOOL_NAMES = sorted(set(
-    fs_agents._READONLY_TOOLS + fs_agents._FILE_EDIT_TOOLS + fs_agents._EXEC_TOOLS + fs_agents._WEB_TOOLS
-))
+# Ordered tool groups for the agent editing UI (group title, tool names).
+# Order: read-only, file editing, execution, web.
+TOOL_GROUPS = [
+    ("Read-only Tools",             list(fs_agents._READONLY_TOOLS)),
+    ("File Editing Tools",          list(fs_agents._FILE_EDIT_TOOLS)),
+    ("Execution Tools",             list(fs_agents._EXEC_TOOLS)),
+    ("Web Search/Extraction Tools", list(fs_agents._WEB_TOOLS)),
+]
+
+ALL_TOOL_NAMES = sorted(set(t for _, tools in TOOL_GROUPS for t in tools))
 
 class WorkflowConfigManager:
     """Manages workflow and agent configuration files."""
@@ -423,6 +430,14 @@ class WorkflowConfigManager:
             if config_file.is_file() and config_file.suffix == '.json':
                 paths.append(config_file)
         return sorted(paths)
+
+    def get_tool_groups(self) -> List[Tuple[str, List[str]]]:
+        """Get ordered (group title, tool names) pairs for the agent editing UI.
+
+        Order: read-only, file editing, execution, web.  Tool names within
+        each group are sorted for display.
+        """
+        return [(title, sorted(tools)) for title, tools in TOOL_GROUPS]
 
     def get_all_tool_names(self) -> List[str]:
         """Get all known tool names for the agent editing UI."""

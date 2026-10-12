@@ -1,5 +1,6 @@
 """CollapsibleSection - A reusable expandable/collapsible panel widget."""
 
+import os
 import wx
 import wx.html
 import html as html_lib
@@ -8,6 +9,36 @@ from typing import Optional, Callable
 
 logger = logging.getLogger(__name__)
 
+# Logging plan (2026-10-10 resume-desync diagnosis): widget per-step DEBUG
+# lines (10+ lines per section construct) buried every real diagnosis under
+# creation spam while carrying no identity — every primary card's header
+# shares one label ("API Request (Fork F, Turn T)"). By default widget debug
+# spam is dropped by _WidgetLoggerProxy (INFO/WARNING/ERROR pass through)
+# and each widget emits ONE INFO identity line instead. Set
+# FLUXIMP_WIDGET_TRACE=1 to restore the raw logger and the per-step trace for
+# a specific repro.
+_WIDGET_TRACE = os.environ.get('FLUXIMP_WIDGET_TRACE', '') not in ('', '0')
+
+
+class _WidgetLoggerProxy:
+    """Debug-dropping stand-in for a Logger (logging plan, 2026-10-10).
+
+    debug() calls are discarded; everything else (info/warning/error/
+    exception/name/...) forwards to the wrapped logger, so widget warnings
+    still land in the app log while the per-step debug flood is silenced
+    unless FLUXIMP_WIDGET_TRACE=1.
+    """
+
+    __slots__ = ('_base',)
+
+    def __init__(self, base: logging.Logger):
+        self._base = base
+
+    def debug(self, *args, **kwargs):
+        pass
+
+    def __getattr__(self, name):
+        return getattr(self._base, name)
 
 
 class CollapsibleSection(wx.Panel):
@@ -34,7 +65,11 @@ class CollapsibleSection(wx.Panel):
                  auto_collapsible: bool = True,
                  extra_below: bool = False,
                  on_user_toggle: Optional[Callable] = None):
-        self._logger = logger or globals().get('logger')
+        # Per logging plan (2026-10-10): wrap the base logger in the
+        # debug-dropping proxy unless FLUXIMP_WIDGET_TRACE=1.
+        base_logger = logger or globals().get('logger')
+        self._logger = (base_logger if _WIDGET_TRACE
+                        else _WidgetLoggerProxy(base_logger))
         self._logger.debug(f'CollapsibleSection.__init__: START label={label!r}')
         super().__init__(parent)
         self._logger.debug('CollapsibleSection.__init__: super() done')
@@ -68,6 +103,13 @@ class CollapsibleSection(wx.Panel):
         self._logger.debug('CollapsibleSection.__init__: attrs set, calling _build_ui')
 
         self._build_ui()
+        # Logging plan (2026-10-10 resume-desync diagnosis): one identity
+        # line per section (INFO passes the proxy) — id() disambiguates
+        # same-label sections; role+ordinal say which card part this is
+        # (the information the 02:10 app log's per-step spam never carried).
+        self._logger.info(
+            'CollapsibleSection: created id=%s label=%r role=%r ordinal=%s',
+            id(self), self._label, self._section_role, self._section_ordinal)
         self._logger.debug('CollapsibleSection.__init__: COMPLETE')
 
     def _build_ui(self):
