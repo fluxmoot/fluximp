@@ -935,7 +935,7 @@ class FileIOAgentProtocol(AgentProtocol, FileIOProtocolBase, RequestLifecycleHoo
             file_id=str(self._output_file)
         )
 
-    def write_model_message_to_user(self, content: str, tags: list, format: str = "plain_text") -> None:
+    def write_model_message_to_user(self, content: str, tags: list, format: str = "markdown") -> None:
         """Write model_message_to_user with tags and format metadata."""
         write_model_message_to_user(
             self._output_handle, content,

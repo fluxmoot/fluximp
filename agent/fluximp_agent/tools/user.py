@@ -66,7 +66,7 @@ def _has_successful_tool_use_since_last_human(state_service) -> bool:
     return False
 
 
-def send_message(content: str, tags: list, format: str = "plain_text", **kwargs) -> ToolResult:
+def send_message(content: str, tags: list, format: str = "markdown", **kwargs) -> ToolResult:
     """
     Display a message to the user.
 
@@ -78,7 +78,7 @@ def send_message(content: str, tags: list, format: str = "plain_text", **kwargs)
         content: The message text to display to the user
         tags: List of tags indicating what the message contains. Must have one or more of:
             findings_report, user_feedback_requested, complete_plan, plan_update, work_completion_summary
-        format: Format of the message content: 'plain_text' or 'markdown' (default: 'plain_text')
+        format: Format of the message content: 'plain_text' or 'markdown' (default: 'markdown')
 
     Returns:
         ToolResult - with success=True and content=the message

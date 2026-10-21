@@ -5,7 +5,7 @@ and extract (objective-driven content extraction from URLs) using the Parallel
 API via the parallel-web SDK.
 """
 
-from parallel import Parallel
+#from parallel import Parallel
 from fluximp_agent.search_service_base import BaseSearchService
 
 

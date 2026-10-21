@@ -1,4 +1,4 @@
-"""Conversation tab - UI for a single dev workflow."""
+"""Conversation tab - UI for a single workflow."""
 
 import wx
 import logging
@@ -46,12 +46,16 @@ class ConversationTab(wx.Panel):
         "Press the Stop button if you want to interrupt its work and interject.")
 
     def __init__(self, parent, conversation: Conversation,
-                 file_watcher=None, config_mgr=None, right_panel=None):
+                 file_watcher=None, config_mgr=None, right_panel=None,
+                 app_settings=None):
         super().__init__(parent)
 
         self.conversation = conversation
         self.file_watcher = file_watcher  # Centralized file watcher for mode switching
         self.right_panel = right_panel  # Shared singleton; all forwards are display-gated (see _panel_displays)
+        # App-wide settings, forwarded to the history view so request cards
+        # can honour the View > API Request Card Metadata visibility toggles.
+        self.app_settings = app_settings
 
         # Track whether the agent is actively working (API request in progress)
         self._agent_active: bool = False
@@ -96,7 +100,9 @@ class ConversationTab(wx.Panel):
         main_sizer.Add(wx.StaticLine(self), 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
 
         # Message history (scrolled) - owned by the WorkflowHistoryView
-        self.history_view = WorkflowHistoryView(self, logger=self.conversation.logger)
+        self.history_view = WorkflowHistoryView(
+            self, logger=self.conversation.logger,
+            app_settings=self.app_settings)
         main_sizer.Add(self.history_view, 1, wx.EXPAND | wx.ALL, 5)
 
         # Footer container: input area, hidden during reload and replaced by
@@ -347,20 +353,20 @@ class ConversationTab(wx.Panel):
         """
         self.conversation.is_agent_active = self._is_any_agent_active()
 
-    def get_send_enabled(self) -> bool:
-        """Read this tab's input/Send enable state (the Send button's).
+    def get_config_enabled(self) -> bool:
+        """Read this tab's Agent/Provider/Model combo enable state.
 
-        Sole consumer: the right panel's tab-switch sync — the shared
-        Agent/Provider/Model combos mirror the displayed tab's Send button
-        exactly (the same §2.2 gate: agent active, §7.7 sequence lock,
-        non-resumable), so the panel asks the tab rather than the
-        conversation: is_agent_active omits those gates and is stale during
-        live conditional runs (launch/completion never re-notified it).
+        Sole consumer: the right panel's tab-switch sync. The combos follow
+        the config gate (_config_gate_enabled) — Send's idle gate, OR
+        unlocked whenever no process of any kind is running — so the panel
+        asks the tab rather than the conversation: is_agent_active omits
+        those gates and is stale during live conditional runs
+        (launch/completion never re-notified it).
         """
         if not self._is_window_valid():
             return False
         try:
-            return self.send_btn.IsEnabled()
+            return self._config_gate_enabled(self.send_btn.IsEnabled())
         except RuntimeError:
             return False
 
@@ -455,8 +461,12 @@ class ConversationTab(wx.Panel):
         return (panel is not None
                 and self.conversation is panel.current_conversation)
 
-    def _notify_panel_config_state(self, enabled: bool):
-        """Forward this tab's input/Send lock state to the shared panel.
+    def _notify_panel_config_state(self, config_enabled: bool):
+        """Forward this tab's config lock state to the shared panel.
+
+        The forwarded state is the Agent/Provider/Model combos' gate
+        (Send's idle gate OR no process of any kind running — see
+        _config_gate_enabled), no longer the input/Send lock itself.
 
         Runs on the GUI thread (the recompute sites are button handlers,
         timer ticks, or CallAfter-marshalled paths). The identity gate
@@ -466,7 +476,7 @@ class ConversationTab(wx.Panel):
         """
         if not self._panel_displays():
             return
-        self.right_panel.apply_displayed_tab_state(enabled)
+        self.right_panel.apply_displayed_tab_state(config_enabled)
 
     def _on_process_starting(self):
         """A process start is beginning on this tab (GUI thread, fired from
@@ -531,6 +541,30 @@ class ConversationTab(wx.Panel):
             if self.conversation.process.poll() is None:
                 return True
         return self._probe_orphan_alive()
+
+    def _config_gate_enabled(self, send_enabled: bool,
+                             alive: Optional[bool] = None) -> bool:
+        """Shared Agent/Provider/Model combos gate (both forward paths).
+
+        The combos keep Send's idle gate (§2.2) as the primary rule, and
+        additionally unlock whenever no process of any kind is running:
+        no primary agent process (no attached Popen, no orphan lock
+        holder), no live conditional run (§7.7), and not in the spawn
+        starting window. A mid-turn process death (e.g. an API error) can
+        leave the turn's io facts non-terminal forever — the one process
+        that would have written the terminal record is gone, and Send
+        stays protocol-locked — which must never deadlock the
+        Provider/Model switch that is the recovery for that state.
+        A non-resumable workflow keeps the combos locked (§7.8).
+        """
+        if self.history_controller.non_resumable:
+            return False
+        if alive is None:
+            alive = self._is_agent_alive()
+        return (send_enabled
+                or (not alive
+                    and not self._process_starting
+                    and len(self._conditional_subprocesses) == 0))
 
     def _orphan_turn_in_flight(self) -> bool:
         """Re-derive mid-turn state from io facts for an unattached
@@ -618,6 +652,13 @@ class ConversationTab(wx.Panel):
                  the sole owner of the pair's enabled state); the grey hint
                  follows the state via _apply_input_enable (enabled invite
                  vs the disabled working/Stop advisory).
+        Combos:  The shared Agent/Provider/Model combos follow the config
+                 gate (_config_gate_enabled) — Send's idle gate, OR unlocked
+                 whenever no process of any kind is running — forwarded only
+                 from the displayed tab. §2.2's exact Send mirror is relaxed:
+                 a mid-turn process death leaves the turn's io facts
+                 non-terminal forever, which must never deadlock the
+                 Provider/Model switch that is the recovery for that state.
         """
         if not self._is_window_valid():
             return
@@ -663,12 +704,19 @@ class ConversationTab(wx.Panel):
                         and not self.history_controller.non_resumable)
         self.send_btn.Enable(send_enabled)
         self._apply_input_enable(send_enabled)
-        # The shared panel's Agent/Provider/Model combos mirror the same
-        # `send_enabled` while this tab is the displayed one: the forward's
-        # identity gate drops every other tab's recompute, so background
-        # transitions can never reach the panel again (the pre-refactor
-        # per-conversation callback's corruption mode is gone).
-        self._notify_panel_config_state(send_enabled)
+        # The shared panel's Agent/Provider/Model combos no longer mirror the
+        # pair's `send_enabled` exactly (§2.2 relaxed): they follow the config
+        # gate — Send's idle gate, OR unlocked whenever no process of any kind
+        # is running. A mid-turn process death (e.g. an API error) leaves the
+        # turn's io facts non-terminal forever — no one lives to write the
+        # terminal record — which used to deadlock the combos on the very
+        # Provider/Model switch that is the recovery for that state.
+        config_enabled = self._config_gate_enabled(send_enabled, alive)
+        # Only the displayed tab reaches the panel: the forward's identity
+        # gate drops every other tab's recompute, so background transitions
+        # can never reach the panel again (the pre-refactor per-conversation
+        # callback's corruption mode is gone).
+        self._notify_panel_config_state(config_enabled)
 
         self.Layout()
         # Header status icon (Option F): the central recompute is the single
@@ -1390,7 +1438,7 @@ class ConversationTab(wx.Panel):
             self.conversation.logger.warning(
                 "Resume failed: could not start the agent process")
             wx.MessageBox(
-                "Failed to resume dev workflow. Please try again.",
+                "Failed to resume workflow. Please try again.",
                 "Resume Error",
                 wx.OK | wx.ICON_ERROR
             )
@@ -1434,7 +1482,7 @@ class ConversationTab(wx.Panel):
         # Ensure process is running before sending
         if not self._ensure_process_running():
             wx.MessageBox(
-                "Failed to resume dev workflow. Please try again.",
+                "Failed to resume workflow. Please try again.",
                 "Resume Error",
                 wx.OK | wx.ICON_ERROR
             )

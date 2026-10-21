@@ -2,6 +2,7 @@
 
 import wx
 import wx.aui
+import logging
 from pathlib import Path
 from typing import Optional, Callable
 import json
@@ -19,6 +20,205 @@ from fluximp_wxwidgets.event_tab import EventTab
 from fluximp_wxwidgets.workspace_settings_tab import WorkspaceSettingsTab
 from fluximp_wxwidgets.app_settings import AppSettings
 from fluximp_wxwidgets.app_settings_tab import AppSettingsTab, NoCuratedProvidersDialog
+from fluximp_wxwidgets.api_metadata_display import API_METADATA_ITEMS
+from fluximp_wxwidgets.api_chart import CHART_SERIES
+from fluximp_wxwidgets.grid_metadata_sums import GRID_SUM_COLUMNS
+from fluximp_wxwidgets import themes
+
+logger = logging.getLogger(__name__)
+
+# The wxAUI dock-art colour ids are read from the wx.aui constants by name in
+# MainFrame._apply_aui_theme; they are deliberately not hard-coded here.  The
+# enum's first five entries are *sizes* -- sash, caption, gripper, pane border,
+# pane button -- so the colours start at 5 and run BACKGROUND, SASH,
+# ACTIVE_CAPTION, ACTIVE_CAPTION_GRADIENT, INACTIVE_CAPTION,
+# INACTIVE_CAPTION_GRADIENT, ACTIVE_CAPTION_TEXT, INACTIVE_CAPTION_TEXT,
+# BORDER, GRIPPER (ids 5..14).  Assuming 0..10 from the roles' positions is how
+# an earlier cut repainted the pane captions with the body text colour and left
+# the rest of the window untouched.
+
+
+def _theme_window_tree(window, bg, fg):
+    """Recursively apply *bg*/*fg* to *window* and every descendant.
+
+    Native controls paint their own background and do not inherit their
+    parent's, so a pane's colours only reach the controls inside it if each
+    one is set explicitly.  Icon bitmaps are unaffected: they are images
+    with baked-in colours, not a control colour, which is exactly why the
+    tree icons keep their fixed palette.
+
+    Buttons are deliberately skipped.  Giving a button an explicit background
+    makes the platform draw it itself, which loses the native themed
+    appearance -- including the hover highlight (a shade of blue on Windows).
+    A theme that set it would look *less* native than the unthemed GUI, and
+    the loss is not recoverable by setting the colour back.  The native
+    appearance (see apply_appearance) is what darkens them where dark mode
+    reaches them.
+    """
+    pending = [window]
+    while pending:
+        current = pending.pop()
+        if not isinstance(current, wx.Button):
+            try:
+                current.SetBackgroundColour(bg)
+                current.SetForegroundColour(fg)
+                current.Refresh()
+            except Exception:
+                # A control that refuses a colour, or a window destroyed
+                # mid-teardown, must not abort the rest of the walk.
+                pass
+        try:
+            pending.extend(current.GetChildren())
+        except Exception:
+            pass
+
+
+def _capture_widget_colours(window) -> dict:
+    """Record each widget's own colours, before any theme paints them.
+
+    Keyed by the widget itself, because the point is to put each one back
+    individually: Troop has to reproduce a pane whose background is the
+    platform's dialog grey *and* trees and a grid inside it that are white,
+    and a single colour cannot express that.
+
+    Buttons are skipped for the same reason _theme_window_tree skips them: an
+    explicit background costs a button its native appearance (including the
+    hover highlight), so they must never be painted -- not even back to a
+    value we recorded ourselves.
+    """
+    snapshot: dict = {}
+    pending = [window]
+    while pending:
+        current = pending.pop()
+        if not isinstance(current, wx.Button):
+            try:
+                snapshot[current] = (current.GetBackgroundColour(),
+                                     current.GetForegroundColour())
+            except Exception:
+                # A control that will not report a colour, or a window
+                # destroyed mid-teardown, must not abort the walk.
+                pass
+        try:
+            pending.extend(current.GetChildren())
+        except Exception:
+            pass
+    return snapshot
+
+
+def _restore_widget_colours(window, snapshot) -> None:
+    """Replay the colours recorded by _capture_widget_colours.
+
+    A widget with no record is left alone: it did not exist when the snapshot
+    was taken, so its colours did not come from the platform and there is
+    nothing to restore.
+    """
+    pending = [window]
+    while pending:
+        current = pending.pop()
+        colours = snapshot.get(current)
+        if colours is not None:
+            try:
+                current.SetBackgroundColour(colours[0])
+                current.SetForegroundColour(colours[1])
+                current.Refresh()
+            except Exception:
+                pass
+        try:
+            pending.extend(current.GetChildren())
+        except Exception:
+            pass
+
+
+def _clear_notebook_backgrounds(window) -> list:
+    """Drop any explicit background from notebooks and their pages.
+
+    A wx.Notebook's tab strip is drawn natively, so its colour can be neither
+    read nor set -- but its page area is made of wx widgets this code paints.
+    When the colour painted on a page is not the one an untouched page would
+    use, the page area and the tab strip disagree, which is exactly the
+    reported symptom: the little tab was right while the page area behind it
+    was a grey that matched neither.
+
+    Clearing the explicit colour is how wx spells "no background of my own" --
+    an invalid colour clears the flag rather than painting black -- so the
+    widget falls back to the platform default and the page area matches the tab
+    strip by construction, on every platform, without this code needing to know
+    what either colour is.
+
+    Returns a description of each widget it cleared, for the log: if the page
+    area is still wrong afterwards, that value is what was painted before.
+    """
+    cleared = []
+    pending = [window]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, wx.Notebook):
+            targets = [current]
+            try:
+                targets += [current.GetPage(i)
+                            for i in range(current.GetPageCount())]
+            except Exception:
+                pass
+            for target in targets:
+                try:
+                    was = target.GetBackgroundColour().GetAsString(
+                        wx.C2S_HTML_SYNTAX)
+                    target.SetBackgroundColour(wx.NullColour)
+                    target.Refresh()
+                    cleared.append(f"{target.__class__.__name__}={was}")
+                except Exception:
+                    pass
+        try:
+            pending.extend(current.GetChildren())
+        except Exception:
+            pass
+    return cleared
+
+
+def _theme_grid(grid, *, cell_bg, cell_fg, label_bg, label_fg, line, widget_bg):
+    """Paint a wx.grid.Grid's cells, labels and grid lines.
+
+    Every colour is a parameter because this serves two cases that differ in
+    all of them: applying a theme, and replaying the colours the platform gave
+    the grid (Troop).  The cells are deliberately not the pane's
+    background colour -- on Windows they are white while the pane is grey, and
+    painting the pane's grey onto them is what made the grid grey.
+
+    Cells are set explicitly as well as by default: a cell keeps the colours
+    it was created with, so the defaults alone would only cover rows appended
+    after this runs.
+
+    The grid's own *highlighting* is deliberately left alone.  wxGrid paints
+    the current cell, that cell's column label and any selected column with
+    colours of its own -- the system highlight by default -- and wxWidgets 3.3
+    highlights the current column's label even when nothing is selected.
+    There is no API to switch that off (it is deliberate: Excel and Calc
+    behave the same way), and suppressing it would mean either painting the
+    labels ourselves or SetUseNativeColLabels, both of which cost more than
+    the cosmetic difference is worth.  So the "Fork" column label -- column 0,
+    where the grid cursor sits once the grid takes focus -- can show a
+    different colour from the rest, and resets on restart.
+    """
+    if grid is None:
+        return
+    try:
+        grid.SetDefaultCellBackgroundColour(cell_bg)
+        grid.SetDefaultCellTextColour(cell_fg)
+        grid.SetLabelBackgroundColour(label_bg)
+        grid.SetLabelTextColour(label_fg)
+        grid.SetGridLineColour(line)
+        grid.SetBackgroundColour(widget_bg)
+        for row in range(grid.GetNumberRows()):
+            for col in range(grid.GetNumberCols()):
+                grid.SetCellBackgroundColour(row, col, cell_bg)
+                grid.SetCellTextColour(row, col, cell_fg)
+    except Exception as exc:
+        logger.warning("Theme: grid re-colour failed: %s", exc)
+
+    try:
+        grid.ForceRefresh()
+    except Exception as exc:
+        logger.warning("Theme: grid refresh failed: %s", exc)
 
 
 
@@ -91,7 +291,7 @@ class NewWorkflowDialog(wx.Dialog):
 class MainFrame(wx.Frame):
     """Main application frame with AUI layout."""
 
-    def __init__(self, parent=None, title="Fluximp Agent GUI", base_dir: Optional[Path] = None,
+    def __init__(self, parent=None, title="FluxImp GUI", base_dir: Optional[Path] = None,
                  app_settings: Optional[AppSettings] = None):
         # Initialize manager with base directory first (needed for config path)
         self.base_dir = base_dir or Path.home() / ".fluximp"
@@ -141,6 +341,15 @@ class MainFrame(wx.Frame):
         
         # Bind events
         self.Bind(wx.EVT_CLOSE, self._on_close)
+
+        # Capture the platform's own chrome colours first, while every widget
+        # still has the colours the platform gave it: Troop replays them so it
+        # matches the GUI as it was before themes existed.
+        self._platform_chrome = self._capture_platform_chrome()
+
+        # Paint the persisted theme on the window chrome.  Tabs opened later
+        # are built with the active theme, so no card re-theming is needed.
+        self._apply_theme()
 
     def _get_window_state_path(self) -> Path:
         """Get path to window state file."""
@@ -219,7 +428,90 @@ class MainFrame(wx.Frame):
         
         # View menu
         view_menu = wx.Menu()
-        
+        # API Request Card toggle (app-wide, persisted in settings.json).
+        # When off (the default) the workflow history shows only the last
+        # completed request card after the last You/Assistant panel plus the
+        # pending card(s), keeping the history compact (see the history
+        # controller's suppression pass).
+        self.id_view_api_cards = wx.NewIdRef()
+        self.item_view_api_cards = view_menu.AppendCheckItem(
+            self.id_view_api_cards, "API Request Card")
+        view_menu.Check(self.id_view_api_cards,
+                        self.app_settings.api_request_cards_visible)
+        view_menu.Bind(wx.EVT_MENU, self._on_toggle_api_cards,
+                       id=self.id_view_api_cards)
+
+        # API Request Card Metadata submenu: one toggleable item per API Request
+        # metadata item (app-wide, persisted in settings.json).  Non-API
+        # system-agent metadata (subdirectory, overall success/failure,
+        # overall run time) is intentionally excluded — it is always shown.
+        api_metadata_menu = wx.Menu()
+        self.api_metadata_items: dict = {}
+        # Bulk section at the top of the submenu: Enable All / Disable All
+        # are one-shot actions (no check marks of their own) that set every
+        # per-item toggle below and persist in a single write, so sweeping
+        # the whole set during testing is one click.
+        self.id_api_metadata_enable_all = wx.NewIdRef()
+        api_metadata_menu.Append(
+            self.id_api_metadata_enable_all, "Enable All")
+        api_metadata_menu.Bind(
+            wx.EVT_MENU, self._on_set_all_api_metadata,
+            id=self.id_api_metadata_enable_all)
+        self.id_api_metadata_disable_all = wx.NewIdRef()
+        api_metadata_menu.Append(
+            self.id_api_metadata_disable_all, "Disable All")
+        api_metadata_menu.Bind(
+            wx.EVT_MENU, self._on_set_all_api_metadata,
+            id=self.id_api_metadata_disable_all)
+
+        api_metadata_menu.AppendSeparator()
+        for key, label, _default in API_METADATA_ITEMS:
+            item_id = wx.NewIdRef()
+            item = api_metadata_menu.AppendCheckItem(item_id, label)
+            item.Check(self.app_settings.is_api_metadata_visible(key))
+            api_metadata_menu.Bind(
+                wx.EVT_MENU, self._on_toggle_api_metadata, id=item_id)
+            self.api_metadata_items[key] = (item_id, item)
+        self.item_api_metadata_submenu = view_menu.AppendSubMenu(
+            api_metadata_menu, "API Request Card Metadata")
+        self.item_api_metadata_submenu.Enable(
+            self.app_settings.api_request_cards_visible)
+        view_menu.AppendSeparator()
+        # API Chart submenu: one toggleable item per per-request token series
+        # the right panel's chart plots (app-wide, persisted in settings.json).
+        # Prompt is on by default; with every item off the chart hides itself
+        # (RightPanel/ForkTurnPanel).  Unlike API Request Card Metadata there
+        # is no bulk Enable/Disable All section.
+        api_chart_menu = wx.Menu()
+        self.api_chart_items: dict = {}
+        for key, label, _role, _default in CHART_SERIES:
+            item_id = wx.NewIdRef()
+            item = api_chart_menu.AppendCheckItem(item_id, label)
+            item.Check(self.app_settings.is_chart_series_visible(key))
+            api_chart_menu.Bind(
+                wx.EVT_MENU, self._on_toggle_api_chart_series, id=item_id)
+            self.api_chart_items[key] = (item_id, item)
+        view_menu.AppendSubMenu(api_chart_menu, "API Chart")
+        # API Grid Sums submenu: one toggleable item per metadata-sum
+        # column the right panel's grid shows (app-wide, persisted in
+        # settings.json).  Every column is off by default -- the grid is a
+        # wall of numbers to most users and the chart is the primary metrics
+        # source -- and with every item off the grid hides itself
+        # (RightPanel/ForkTurnPanel).  Like API Chart there is no bulk
+        # Enable/Disable All section.
+        grid_sum_menu = wx.Menu()
+        self.grid_sum_items: dict = {}
+        for key, label, _column, _default in GRID_SUM_COLUMNS:
+            item_id = wx.NewIdRef()
+            item = grid_sum_menu.AppendCheckItem(item_id, label)
+            item.Check(self.app_settings.is_grid_sum_visible(key))
+            grid_sum_menu.Bind(
+                wx.EVT_MENU, self._on_toggle_grid_sum, id=item_id)
+            self.grid_sum_items[key] = (item_id, item)
+        self.item_grid_sum_submenu = view_menu.AppendSubMenu(
+            grid_sum_menu, "API Grid Sums")
+
+        view_menu.AppendSeparator()
         self.id_view_left = wx.NewIdRef()
         self.item_view_left = view_menu.AppendCheckItem(self.id_view_left, "Show Left Panel")
         view_menu.Check(self.id_view_left, True)
@@ -229,7 +521,22 @@ class MainFrame(wx.Frame):
         self.item_view_right = view_menu.AppendCheckItem(self.id_view_right, "Show Right Panel")
         view_menu.Check(self.id_view_right, True)
         view_menu.Bind(wx.EVT_MENU, self._on_toggle_right_panel, id=self.id_view_right)
-        
+        # Theme submenu (fluximp_wxwidgets.themes): one radio item per
+        # theme, checked = the active theme.  Switching is gated on having
+        # no open tabs -- an already-built card keeps the colors it was
+        # constructed with -- so the submenu is rebuilt each time the View
+        # menu opens (see _rebuild_theme_menu): with tabs open it collapses
+        # to a single disabled "Close all tabs first" line.
+        self.view_menu = view_menu
+        self.theme_menu = wx.Menu()
+        self.theme_menu_items: dict = {}
+        view_menu.AppendSubMenu(self.theme_menu, "Theme")
+        # Bound ONCE, not per-rebuild: _rebuild_theme_menu allocates fresh
+        # item ids every time, so a per-item Bind would accumulate handler
+        # entries for the life of the process.  _on_select_theme dispatches
+        # by id through theme_menu_items instead.
+        self.theme_menu.Bind(wx.EVT_MENU, self._on_select_theme)
+        self.Bind(wx.EVT_MENU_OPEN, self._on_menu_open)
         menubar.Append(view_menu, "&View")
         
         self.SetMenuBar(menubar)
@@ -602,7 +909,8 @@ class MainFrame(wx.Frame):
                 self.notebook, conversation,
                 file_watcher=self.file_watcher,
                 config_mgr=self.config_mgr,
-                right_panel=self.right_panel)
+                right_panel=self.right_panel,
+                app_settings=self.app_settings)
             self.open_tabs[conv_id] = tab
 
             title = tab.get_title()
@@ -637,6 +945,10 @@ class MainFrame(wx.Frame):
 
         # Register conversation with file watcher and start the reload
         # streaming driver deferred (until after the page is added).
+        # Adopt the app-wide API Request Card toggle before the reload
+        # streams so the backlog finalizes into the right mode.
+        tab.history_controller.set_api_cards_visible(
+            self.app_settings.api_request_cards_visible)
         self.file_watcher.register_conversation(conversation)
         wx.CallAfter(tab.history_controller.load_existing)
     
@@ -805,9 +1117,29 @@ class MainFrame(wx.Frame):
             if isinstance(page, ConversationTab):
                 # Update right panel with current conversation
                 self.right_panel.set_conversation(page.conversation, tab=page)
+                # Background tabs adopt the app-wide API Request Card toggle
+                # only when they become active.
+                page.history_controller.set_api_cards_visible(
+                    self.app_settings.api_request_cards_visible)
 
         event.Skip()
     
+    def _on_toggle_api_cards(self, event: wx.Event):
+        """Toggle rendering of every API Request card in the history.
+
+        Persists the new state (app-wide).  The change applies immediately
+        to the active conversation tab; background tabs adopt it when they
+        next become active (see _on_tab_changed).  With the cards switched
+        off the API Request Card Metadata submenu is greyed out — its items
+        have no cards to affect.
+        """
+        visible = self.item_view_api_cards.IsChecked()
+        self.app_settings.api_request_cards_visible = visible
+        self.item_api_metadata_submenu.Enable(visible)
+        tab = self._get_current_tab()
+        if tab is not None:
+            tab.history_controller.set_api_cards_visible(visible)
+
     def _on_toggle_left_panel(self, event: wx.Event):
         """Toggle left panel visibility."""
         pane = self.aui_mgr.GetPane("left")
@@ -819,7 +1151,391 @@ class MainFrame(wx.Frame):
         pane = self.aui_mgr.GetPane("right")
         pane.Show(not pane.IsShown())
         self.aui_mgr.Update()
+
+    def _on_toggle_api_metadata(self, event: wx.Event):
+        """Toggle visibility of one API Request metadata item.
+
+        Persists the new state (app-wide) and pushes it to every open
+        conversation's history view so already-built cards update live.
+        """
+        event_id = event.GetId()
+        for key, (item_id, item) in self.api_metadata_items.items():
+            if int(item_id) == event_id:
+                self.app_settings.set_api_metadata_visible(
+                    key, item.IsChecked())
+                self._refresh_api_metadata_display()
+                return
+
+    def _on_set_all_api_metadata(self, event: wx.Event):
+        """Enable or disable every API Request metadata item at once.
+
+        The View > API Request Card Metadata submenu's bulk section (Enable
+        All / Disable All) routes here: every per-item check is set, the
+        state is persisted in a single write and every open conversation is
+        refreshed via the same path as a single toggle.
+        """
+        enable = event.GetId() == int(self.id_api_metadata_enable_all)
+        for _key, (_item_id, item) in self.api_metadata_items.items():
+            item.Check(enable)
+        self.app_settings.set_all_api_metadata_visible(enable)
+        self._refresh_api_metadata_display()
+
+    def _on_toggle_api_chart_series(self, event: wx.Event):
+        """Toggle one per-request token series on the right panel's chart.
+
+        Persists the new state (app-wide) and pushes it to the chart, which
+        hides itself when every series is switched off.
+        """
+        event_id = event.GetId()
+        for key, (item_id, item) in self.api_chart_items.items():
+            if int(item_id) == event_id:
+                self.app_settings.set_chart_series_visible(
+                    key, item.IsChecked())
+                panel = getattr(self, "right_panel", None)
+                if panel is not None:
+                    panel.apply_chart_series_visibility()
+                return
+
+    def _on_toggle_grid_sum(self, event: wx.Event):
+        """Toggle one metadata-sum column on the right panel's grid.
+
+        Persists the new state (app-wide) and pushes it to the grid, which
+        hides itself when every column is switched off.
+        """
+        event_id = event.GetId()
+        for key, (item_id, item) in self.grid_sum_items.items():
+            if int(item_id) == event_id:
+                self.app_settings.set_grid_sum_visible(key, item.IsChecked())
+                panel = getattr(self, "right_panel", None)
+                if panel is not None:
+                    panel.apply_grid_sum_visibility()
+                return
+
+    def _refresh_api_metadata_display(self):
+        """Push API metadata visibility changes to every open conversation."""
+        for tab in list(self.open_tabs.values()):
+            view = getattr(tab, 'history_view', None)
+            if view is None:
+                continue
+            try:
+                view.refresh_api_metadata_display()
+            except RuntimeError:
+                continue
     
+    def _on_menu_open(self, event: wx.MenuEvent):
+        """Rebuild the View > Theme submenu just before the View menu opens."""
+        try:
+            menu = event.GetMenu()
+            # wxPython normally hands back the same Python object for a given
+            # C++ menu, so `is` holds; the title comparison is a fallback if
+            # that identity ever fails.  The theme submenu's own title
+            # ("Theme") can never match "&View", so the submenu is never
+            # rebuilt while it is itself open; a popup menu (empty title)
+            # never matches either.
+            if menu is not None and (
+                    menu is self.view_menu
+                    or menu.GetTitle() == self.view_menu.GetTitle()):
+                self._rebuild_theme_menu()
+                # Re-assert the API Request Card Metadata gate in case the
+                # API Request Card toggle changed while the menu was closed.
+                self.item_api_metadata_submenu.Enable(
+                    self.app_settings.api_request_cards_visible)
+        except RuntimeError:
+            # Menu/frame torn down mid-open (teardown race).
+            pass
+        event.Skip()
+
+    def _rebuild_theme_menu(self):
+        """Populate the View > Theme submenu for the current tab state.
+
+        With any tab open the theme cannot be switched (an open card keeps
+        the colors it was built with), so the submenu collapses to a single
+        disabled "Close all tabs first" line; with no tabs open it lists one
+        radio item per theme, checked = the active theme.
+        """
+        menu = self.theme_menu
+        # Rebuild from scratch on every open: cheap, and it keeps the radio
+        # checks and the open-tab gate from ever drifting out of sync.
+        # wxPython binds wxMenu's item-deleting overload as DestroyItem: the
+        # bare Destroy() name resolves to wxEvtHandler.Destroy(), which takes
+        # no arguments (that is the call a popup menu makes to delete itself
+        # below), so Destroy(item) raises "too many arguments".
+        while menu.GetMenuItemCount() > 0:
+            menu.DestroyItem(menu.FindItemByPosition(0))
+        self.theme_menu_items = {}
+
+        if self.notebook.GetPageCount() > 0:
+            menu.Append(wx.ID_ANY, "Close all tabs first").Enable(False)
+            return
+
+        for name in themes.theme_names():
+            item_id = wx.NewIdRef()
+            item = menu.AppendRadioItem(
+                item_id, themes.DISPLAY_NAMES.get(name, name))
+            item.Check(name == themes.active_name())
+            self.theme_menu_items[int(item_id)] = name
+
+    def _on_select_theme(self, event: wx.Event):
+        """Persist and apply the chosen theme (reachable only with no tabs)."""
+        name = self.theme_menu_items.get(int(event.GetId()))
+        if name is None:
+            return
+        self.app_settings.theme = name
+        themes.set_active(self.app_settings.theme)
+        self._apply_theme()
+
+    def _capture_platform_chrome(self) -> dict:
+        """Snapshot the colours the platform gave each surface, before we paint.
+
+        Troop reproduces the GUI as it was before themes existed, and that GUI
+        left these colours to the platform -- but not all of them to the *same*
+        value, which is why this is per-surface rather than one colour.  On
+        Windows the pane background is the dialog grey while the trees, the
+        grid's cells and the notebook's page area are white, so replaying one
+        captured grey over all of them is what turned the trees, the grid and
+        the page area grey while the pane itself was finally right.
+
+        Recorded at construction, before the first _apply_theme, while every
+        widget still has the colours the platform gave it.  Replayed by
+        _apply_theme for the Troop theme, which also lets a switch *back*
+        from a dark theme restore the real thing rather than leaving the dark
+        colours behind.
+        """
+        grid_colours = None
+        grid = self._fork_turn_grid()
+        if grid is not None:
+            try:
+                grid_colours = {
+                    "cell_bg": grid.GetDefaultCellBackgroundColour(),
+                    "cell_fg": grid.GetDefaultCellTextColour(),
+                    "label_bg": grid.GetLabelBackgroundColour(),
+                    "label_fg": grid.GetLabelTextColour(),
+                    "line": grid.GetGridLineColour(),
+                    "widget_bg": grid.GetBackgroundColour(),
+                }
+            except Exception as exc:
+                logger.warning("Theme: grid colour capture failed: %s", exc)
+        panes = {}
+        for pane_name in ("left", "right"):
+            pane = self.aui_mgr.GetPane(pane_name)
+            if pane is not None and pane.window is not None:
+                panes[pane_name] = _capture_widget_colours(pane.window)
+        return {
+            "frame": (self.GetBackgroundColour(), self.GetForegroundColour()),
+            "notebook": (self.notebook.GetBackgroundColour(),
+                         self.notebook.GetForegroundColour()),
+            "grid": grid_colours,
+            "panes": panes,
+        }
+
+    def _fork_turn_grid(self):
+        """The right panel's fork/turn grid, or None when it is not built."""
+        panel = getattr(self, "right_panel", None)
+        return getattr(getattr(panel, "fork_turn_panel", None), "grid", None)
+
+    def _fork_turn_chart(self):
+        """The right panel's API chart, or None when it is not built."""
+        panel = getattr(self, "right_panel", None)
+        return getattr(getattr(panel, "fork_turn_panel", None), "chart", None)
+
+    def _apply_theme(self):
+        """Re-color the window chrome for the active theme.
+
+        Only chrome is themed live: a switch is reachable only with zero
+        open tabs (see _rebuild_theme_menu), so no card needs re-theming --
+        tabs opened afterwards resolve colors at construction.
+
+        Every surface the frame owns is themed except the icon bitmaps: the
+        panes and everything inside them, the grid, the notebook, and then the
+        two surfaces no wx widget colour can reach -- the AUI art (see
+        _apply_aui_theme) and the native appearance (see _apply_appearance).
+
+        Troop is the exception, and it is why this branches rather than reading
+        every colour out of one palette.  Troop reproduces the GUI as it was
+        before themes existed, and that GUI left these colours to the platform
+        -- but not all of them to the *same* value.  On Windows the pane
+        background is the dialog grey while the trees, the grid's cells and the
+        notebook's page area are white, so no single colour can reproduce it:
+        painting the pane's grey over all of them is exactly what turned the
+        trees, the grid and the page area grey.  Troop therefore replays the
+        per-widget colours captured at construction (see
+        _capture_platform_chrome).
+        """
+        theme = themes.active()
+        platform = getattr(self, "_platform_chrome", None)
+        grid = self._fork_turn_grid()
+
+        if themes.active_name() == themes.TROOP_THEME_KEY and platform:
+            self.SetBackgroundColour(platform["frame"][0])
+            self.SetForegroundColour(platform["frame"][1])
+            cleared = []
+            for pane_name in ("left", "right"):
+                pane = self.aui_mgr.GetPane(pane_name)
+                if pane is None or pane.window is None:
+                    continue
+                _restore_widget_colours(
+                    pane.window, platform["panes"].get(pane_name, {}))
+                cleared.extend(_clear_notebook_backgrounds(pane.window))
+            if cleared:
+                logger.info(
+                    "Theme: cleared the explicit background of %d notebook "
+                    "widget(s) so each page area matches its native tab "
+                    "strip: %s", len(cleared), ", ".join(cleared))
+            if grid is not None and platform["grid"]:
+                _theme_grid(grid, **platform["grid"])
+            self.notebook.SetBackgroundColour(platform["notebook"][0])
+            self.notebook.SetForegroundColour(platform["notebook"][1])
+        else:
+            bg = themes.to_wx(theme.panel_bg)
+            fg = themes.to_wx(theme.text_fg)
+            self.SetBackgroundColour(themes.to_wx(theme.window_bg))
+            self.SetForegroundColour(fg)
+            # Both panes are themed, children included: a native control
+            # (tree, notebook, grid, text field) paints its own background and
+            # does not inherit the panel's, so each has to be told explicitly.
+            # The tree *icons* are the one exception -- they are bitmaps drawn
+            # with fixed colours and no Set*Colour call reaches them.
+            for pane_name in ("left", "right"):
+                pane = self.aui_mgr.GetPane(pane_name)
+                if pane is not None and pane.window is not None:
+                    _theme_window_tree(pane.window, bg, fg)
+            if grid is not None:
+                _theme_grid(
+                    grid,
+                    cell_bg=bg,
+                    cell_fg=fg,
+                    label_bg=themes.to_wx(theme.section_header_bg),
+                    label_fg=fg,
+                    line=themes.to_wx(theme.panel_border),
+                    widget_bg=bg)
+            self.notebook.SetBackgroundColour(bg)
+            self.notebook.SetForegroundColour(fg)
+
+        # The chart paints itself from the theme's own chart roles, so it is
+        # repainted here rather than left to the pane-wide walk above (which
+        # would give it the pane's background) or to the captured platform
+        # colours (which are not its own).
+        chart = self._fork_turn_chart()
+        if chart is not None:
+            chart.apply_theme()
+
+        self.notebook.Refresh()
+        # The area behind the panes, the pane captions and the notebook's tab
+        # strip are painted by the AUI art providers, not by the widgets.
+        self._apply_aui_theme(theme)
+        # The title bar, the native menu bar and the standard controls inside
+        # the panes are drawn by the OS or by wx itself, so they need the
+        # native appearance rather than any wx widget colour call.
+        self._apply_appearance(themes.active_name())
+        self.Refresh()
+        self.Update()
+
+    def _apply_aui_theme(self, theme) -> None:
+        """Theme the AUI chrome: the area behind the panes, the pane
+        captions ("Workspaces", "Fork/Turn History"), the sashes between
+        panes and the notebook's tab strip.
+
+        Those surfaces are painted by the AUI art providers, not by the
+        widgets themselves, so without this a theme switch would only
+        re-color the panels' own backgrounds and the window would look
+        almost untouched.
+
+        Every step logs what it did.  wxAuiDefaultDockArt::SetColour
+        silently ignores a colour id it does not recognise, so a silent
+        no-op here is otherwise indistinguishable from a repaint failure
+        (and an unlogged one at that -- which is exactly how the first cut
+        of this method shipped a no-op).
+
+        Nothing in this method may raise: a theme switch must never be able
+        to break the window, and a wx build without the AUI art bindings
+        keeps the platform look (which is exactly Troop's appearance).
+        """
+        bg = themes.to_wx(theme.panel_bg)
+        fg = themes.to_wx(theme.text_fg)
+        caption_bg = themes.to_wx(theme.section_header_bg)
+        border = themes.to_wx(theme.panel_border)
+
+        dock_art = None
+        try:
+            dock_art = self.aui_mgr.GetArtProvider()
+        except AttributeError as exc:
+            logger.warning("AUI theme: no dock art provider (%s)", exc)
+
+        if dock_art is not None:
+            # The colour ids come from the wx.aui constants by name, never
+            # from hard-coded numbers: the enum's first five entries are
+            # *sizes*, so the colours start at 5, and a build that renumbered
+            # them would otherwise be repainted on the wrong surfaces.
+            for attr_name, colour in (
+                    ("AUI_DOCKART_BACKGROUND_COLOUR", bg),
+                    ("AUI_DOCKART_SASH_COLOUR", border),
+                    ("AUI_DOCKART_BORDER_COLOUR", border),
+                    ("AUI_DOCKART_GRIPPER_COLOUR", border),
+                    ("AUI_DOCKART_ACTIVE_CAPTION_COLOUR", caption_bg),
+                    ("AUI_DOCKART_ACTIVE_CAPTION_GRADIENT_COLOUR", caption_bg),
+                    ("AUI_DOCKART_ACTIVE_CAPTION_TEXT_COLOUR", fg),
+                    ("AUI_DOCKART_INACTIVE_CAPTION_COLOUR", caption_bg),
+                    ("AUI_DOCKART_INACTIVE_CAPTION_GRADIENT_COLOUR", caption_bg),
+                    ("AUI_DOCKART_INACTIVE_CAPTION_TEXT_COLOUR", fg)):
+                art_id = getattr(wx.aui, attr_name, None)
+                if art_id is None:
+                    logger.warning("AUI theme: wx.aui.%s is missing", attr_name)
+                    continue
+                try:
+                    dock_art.SetColour(art_id, colour)
+                except Exception as exc:
+                    # A theme switch must never raise; log and press on.
+                    logger.warning("AUI theme: SetColour(%s=%s) failed: %s",
+                                   attr_name, art_id, exc)
+            # Read-back, at debug: the only way to tell an id this build
+            # actually knows from one it silently ignores.
+            try:
+                got = dock_art.GetColour(
+                    wx.aui.AUI_DOCKART_ACTIVE_CAPTION_COLOUR)
+                logger.debug(
+                    "AUI theme: active caption colour now %s (wanted %s)",
+                    got.GetAsString(wx.C2S_HTML_SYNTAX),
+                    caption_bg.GetAsString(wx.C2S_HTML_SYNTAX))
+            except Exception as exc:
+                logger.debug("AUI theme: caption colour read-back failed: %s",
+                             exc)
+
+        # Recolor the notebook's existing tab art in place.  A new art
+        # provider is deliberately NOT installed: wxAuiNotebook takes
+        # ownership of the art it is given, and a Python-held reference to
+        # an owned art is a double-free hazard at teardown.
+        tab_art = None
+        try:
+            tab_art = self.notebook.GetArtProvider()
+        except AttributeError as exc:
+            logger.warning("AUI theme: notebook has no tab art (%s)", exc)
+        if tab_art is not None:
+            try:
+                tab_art.SetColour(bg)
+                tab_art.SetActiveColour(caption_bg)
+                logger.debug("AUI theme: notebook tab art recoloured")
+            except Exception as exc:
+                logger.warning("AUI theme: tab art recolour failed: %s", exc)
+
+        # The art changes only take effect on the next paint of the manager's
+        # window and of the windows it manages.
+        try:
+            self.aui_mgr.Update()
+        except Exception as exc:
+            logger.warning("AUI theme: aui Update failed: %s", exc)
+        self.Refresh()
+        self.Update()
+
+    def _apply_appearance(self, theme_name: str) -> None:
+        """Ask wx for the native light/dark appearance matching *theme_name*.
+
+        Thin per-frame wrapper around the module-level apply_appearance() so
+        _apply_theme reads like its sibling _apply_* calls; see that function
+        for why this is the portable route to the title bar and the menu bar,
+        which no wx widget colour can reach.
+        """
+        apply_appearance(theme_name)
+
     def _on_exit(self, event: wx.Event):
         """Handle Exit menu item."""
         self.Close()
@@ -840,3 +1556,141 @@ class MainFrame(wx.Frame):
         self.aui_mgr.UnInit()
 
         event.Skip()
+
+
+def _resolve_appearance_enum(app):
+    """Find the wxApp::Appearance enum wherever this build exposes it.
+
+    The enum is declared inside wxAppBase, so wxPython surfaces it as
+    wx.PyApp.Appearance -- reachable as wx.App.Appearance and on the app
+    instance too -- and *not* as wx.Appearance.  Searching only the wx module
+    is why the first cut never found it and skipped the portable route
+    entirely, which is what left a switch back to a light theme unable to
+    clear the dark appearance.
+
+    Returns the enum, or None on a wx build that predates it (pre-4.3), where
+    the caller falls through to the MSW-only opt-in and then to a no-op.
+    """
+    for holder in (getattr(wx, "App", None),
+                   getattr(wx, "PyApp", None),
+                   app,
+                   wx):
+        enum = getattr(holder, "Appearance", None)
+        if enum is not None and getattr(enum, "Light", None) is not None:
+            return enum
+    return None
+
+
+def _appearance_result_ok(result) -> bool:
+    """Interpret SetAppearance's AppearanceResult return value.
+
+    wxAppBase::SetAppearance returns AppearanceResult::{Failure, Ok,
+    CannotChange} and the base implementation returns Failure, so the return
+    value -- not an exception -- is how "this build cannot do it" is reported.
+    Compared by name because the enum's Python surface varies between bindings;
+    a binding that exposes no return value at all is treated as success, since
+    the call did not raise.
+    """
+    text = str(getattr(result, "name", result)).lower()
+    return "failure" not in text and "cannot" not in text
+
+
+def apply_appearance(theme_name: str) -> None:
+    """Ask wxWidgets for the native light or dark appearance for *theme_name*.
+
+    This is the portable route to the surfaces wxWidgets does not let an
+    application colour directly: the window title bar, the native menu bar and
+    the standard controls inside the panes (scrollbars, tree expanders, combo
+    popups).  wxWidgets implements it per platform internally -- a dark title
+    bar and menu bar on MSW, the dark GTK theme variant on Linux, NSAppearance
+    on macOS -- so the call is identical everywhere and no OS-specific code is
+    needed here.
+
+    wx 4.3 / wxWidgets 3.3 added it.  On an older wx the attribute is simply
+    absent, so this degrades to a no-op and the app keeps its own
+    (theme-coloured) widgets; every lookup is by getattr for exactly that
+    reason.
+
+    Call it before creating any windows for full effect -- main.py does, right
+    after resolving the persisted theme and before MainFrame exists.  Calling
+    it again for a live window (a theme switch) is best-effort: wx documents
+    that a later change may not reach every already-created native control, so
+    the theme's own colours stay the source of truth for the widgets.
+
+    Both directions are requested.  SetAppearance() takes Light as well as
+    Dark, and asking for Light is the only portable way to *leave* dark mode;
+    see _resolve_appearance_enum for why that direction used to be skipped.
+    """
+    dark = themes.is_dark(theme_name)
+    # Troop is the GUI as it was before themes existed, and that GUI never
+    # asked wx for an appearance at all -- so this asks for *System* rather
+    # than forcing Light.  Forcing Light would make Troop differ from the
+    # unthemed GUI on a machine whose desktop is dark, and "match the unthemed
+    # GUI" is the whole point of Troop.
+    if theme_name == themes.TROOP_THEME_KEY:
+        wanted_name = "System"
+    else:
+        wanted_name = "Dark" if dark else "Light"
+    app = wx.GetApp()
+
+    # Portable route first: wxApp::SetAppearance() is the documented,
+    # cross-platform entry point, and the only one that can force a *light*
+    # appearance regardless of the system setting (see the fallback below).
+    #
+    # The enum is resolved rather than read off wx because it is declared
+    # inside wxAppBase: wxPython surfaces it as wx.PyApp.Appearance (and
+    # therefore as wx.App.Appearance and on the app instance), never as
+    # wx.Appearance.  Reading only the wx module is why an earlier cut skipped
+    # this route entirely -- and with the fallback below gated on `if dark:`,
+    # a switch back to a light theme then made no call at all, leaving the
+    # native chrome dark until the app was restarted.
+    enum = _resolve_appearance_enum(app)
+    if enum is not None:
+        wanted = getattr(enum, wanted_name, None)
+        for label, holder in (("wx.GetApp()", app),
+                              ("wx.App", getattr(wx, "App", None)),
+                              ("wx.PyApp", getattr(wx, "PyApp", None))):
+            func = (getattr(holder, "SetAppearance", None)
+                    if holder is not None else None)
+            if not callable(func):
+                continue
+            try:
+                result = func(wanted)
+            except Exception as exc:
+                logger.info("Theme: %s.SetAppearance(%s) failed: %s",
+                            label, wanted_name, exc)
+                continue
+            if _appearance_result_ok(result):
+                logger.info(
+                    "Theme: native appearance set to %s via %s.SetAppearance "
+                    "-> %s", wanted_name, label, result)
+                return
+            logger.info(
+                "Theme: %s.SetAppearance(%s) -> %s (not applied); trying the "
+                "next route", label, wanted_name, result)
+
+    # wxMSW's own opt-in, attempted purely by name so a GTK or macOS build
+    # simply has no such attribute and this is a no-op there: no platform
+    # check, no ctypes, just the next wx API in the list.
+    #
+    # Called for *both* light and dark themes.  wx/msw/app.h declares only
+    # DarkMode_Auto = 0 and DarkMode_Always = 1 -- there is no "force light"
+    # flag -- so Auto ("use dark mode if the system is using it") is the
+    # closest available "stop forcing dark", and calling it on the light
+    # branch is what clears a previously-set DarkMode_Always.
+    enable = getattr(app, "MSWEnableDarkMode", None)
+    flag = getattr(app, "DarkMode_Always" if dark else "DarkMode_Auto", None)
+    if callable(enable) and flag is not None:
+        try:
+            enable(flag)
+        except Exception as exc:
+            logger.info("Theme: MSWEnableDarkMode(%s) failed: %s", flag, exc)
+        else:
+            logger.info("Theme: native appearance set to %s via "
+                        "MSWEnableDarkMode(%s)", wanted_name, flag)
+            return
+
+    logger.info(
+        "Theme: no usable native appearance call on this wx "
+        "(Appearance enum: %s, MSWEnableDarkMode: %s); native chrome keeps "
+        "the platform look", enum is not None, callable(enable))

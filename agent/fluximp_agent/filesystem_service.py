@@ -16,6 +16,34 @@ from pathlib import Path
 from typing import Optional, Tuple, List
 
 
+# Maximum file size (in bytes) that line-mode tools (view/edit) will process.
+# Tools that read or rewrite a file line-by-line refuse to operate on files
+# larger than this and return an error so the LLM is informed immediately.
+MAX_LINE_MODE_FILE_BYTES = 64 * 1024 * 1024  # 64 MB
+
+
+def check_line_mode_file_size(path: Path, display_path: str,
+                              max_bytes: int = MAX_LINE_MODE_FILE_BYTES) -> Optional[str]:
+    """Return an error string if the file exceeds the line-mode size limit, else None.
+
+    Used by tools that view or edit existing files in line mode so that an
+    oversized file fails the tool call immediately (informing the LLM) rather
+    than being read into memory or rendered into the context.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError as e:
+        return f"Error: Could not determine size of '{display_path}': {e}"
+    if size > max_bytes:
+        return (
+            f"Error: File '{display_path}' is {size:,} bytes, which exceeds the maximum "
+            f"of {max_bytes:,} bytes ({max_bytes // (1024 * 1024)} MB) allowed for line-mode "
+            f"tools. This tool reads/rewrites the file line-by-line and cannot safely process "
+            f"a file this large. Use ripgrep_search to locate specific content, or split/reduce "
+            f"the file first."
+        )
+    return None
+
 class FileSystemService:
     """Service for managing filesystem operations and working directory state.
     

@@ -1,4 +1,4 @@
-# Conditional sequence orchestration for Fluximp.
+# Conditional sequence orchestration for FluxImp.
 
 import json
 import pickle

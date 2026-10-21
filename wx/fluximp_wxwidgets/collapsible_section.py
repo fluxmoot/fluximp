@@ -7,6 +7,8 @@ import html as html_lib
 import logging
 from typing import Optional, Callable
 
+from fluximp_wxwidgets import themes
+
 logger = logging.getLogger(__name__)
 
 # Logging plan (2026-10-10 resume-desync diagnosis): widget per-step DEBUG
@@ -98,8 +100,8 @@ class CollapsibleSection(wx.Panel):
         self._right_label: Optional[wx.StaticText] = None
         self._indicator_text = "v" if expanded else ">"
         self._indent = indent
-        self._header_color = header_color or wx.Colour(240, 240, 240)
-        self._content_color = content_color or self.GetBackgroundColour()
+        self._header_color = header_color or themes.to_wx(themes.active().section_header_bg)
+        self._content_color = content_color or themes.to_wx(themes.active().section_content_bg)
         self._logger.debug('CollapsibleSection.__init__: attrs set, calling _build_ui')
 
         self._build_ui()
@@ -151,7 +153,7 @@ class CollapsibleSection(wx.Panel):
         )
         extra_font = self._extra_label.GetFont()
         self._extra_label.SetFont(extra_font)
-        self._extra_label.SetForegroundColour(wx.Colour(128, 128, 128))
+        self._extra_label.SetForegroundColour(themes.to_wx(themes.active().muted_fg))
         if self._extra_below:
             # Own centered line beneath the header row (request card
             # headers): the extra text (e.g. the "pending: Ns" countdown)
@@ -350,7 +352,7 @@ class CollapsibleSection(wx.Panel):
             return
         if self._right_label is None:
             self._right_label = wx.StaticText(self)
-            self._right_label.SetForegroundColour(wx.Colour(128, 128, 128))
+            self._right_label.SetForegroundColour(themes.to_wx(themes.active().muted_fg))
             # Insert after the stretch spacer (item 0 is the title, item 1
             # the stretch spacer), keeping the span rightmost on the row;
             # in inline-extra mode it lands before _extra_label, which then
@@ -362,6 +364,10 @@ class CollapsibleSection(wx.Panel):
             self._right_label.Bind(wx.EVT_LEFT_DOWN, self._on_header_click)
             self._right_label.SetCursor(wx.Cursor(wx.CURSOR_HAND))
         self._right_label.SetLabel(text)
+        # Hide the span when it becomes empty (e.g. every API metadata
+        # item it carries toggled off) so the header row does not reserve
+        # a blank gap; a later non-empty set_right_text re-shows it.
+        self._right_label.Show(bool(text))
         self.Layout()
 
     def get_content_panel(self) -> wx.Panel:
@@ -402,10 +408,11 @@ class CollapsibleSection(wx.Panel):
         escaped = html_lib.escape(text)
         formatted = escaped.replace('\n', '<br>\n')
         bg_hex = self._content_color.GetAsString(wx.C2S_HTML_SYNTAX)
+        fg_hex = themes.to_wx(themes.active().text_fg).GetAsString(wx.C2S_HTML_SYNTAX)
 
         html_content = (
             f'<html><body bgcolor="{bg_hex}">'
-            f'<font face="sans-serif" size="3">{formatted}</font>'
+            f'<font face="sans-serif" size="3" color="{fg_hex}">{formatted}</font>'
             f'</body></html>'
         )
 

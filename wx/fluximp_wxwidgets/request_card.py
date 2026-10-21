@@ -15,6 +15,8 @@ from fluximp_wxwidgets.collapsible_section import (
 from fluximp_protocol.user_agent.file_io.defs import parse_utc_timestamp
 from fluximp_wxwidgets.conversation_manager import ConversationMessage, PermissionRequest
 
+from fluximp_wxwidgets import themes
+
 logger = logging.getLogger(__name__)
 
 
@@ -30,6 +32,7 @@ class RequestCard(wx.Panel):
                  is_system_agent: bool = False,
                  system_agent_type: str = "",
                  logger: Optional[logging.Logger] = None,
+                 app_settings=None,
                  pos=wx.DefaultPosition):
         # Logging plan (2026-10-10 resume-desync diagnosis): the card's ~15
         # per-step DEBUG lines are silenced by default (debug-dropping
@@ -52,6 +55,9 @@ class RequestCard(wx.Panel):
         self.conditional_agent_name = conditional_agent_name
         self.is_system_agent = is_system_agent
         self.system_agent_type = system_agent_type
+        # App-wide settings (View > API Request Card Metadata visibility); None
+        # falls back to showing every metadata item (legacy behavior).
+        self._app_settings = app_settings
         
         # State tracking
         self._is_pending = True
@@ -88,17 +94,18 @@ class RequestCard(wx.Panel):
         self._main_sizer = wx.BoxSizer(wx.VERTICAL)
 
         # System agents use gray palette; conditional agents use amber; primary agents use yellow/green
+        theme = themes.active()
         if self.is_system_agent:
-            pending_color = wx.Colour(252, 252, 252)     # Very light gray
-            response_color = wx.Colour(248, 248, 248)    # Light gray
+            pending_color = themes.to_wx(theme.card_system_header)
+            response_color = themes.to_wx(theme.card_system_content)
             header_label = f"⚙ {self.system_agent_type}"
         elif self.is_conditional:
-            pending_color = wx.Colour(255, 245, 230)     # Warm amber tint
-            response_color = wx.Colour(255, 236, 210)    # Light amber
+            pending_color = themes.to_wx(theme.card_conditional_header)
+            response_color = themes.to_wx(theme.card_conditional_content)
             header_label = f"→ {self.conditional_agent_name} (Fork {self._fork}, Turn {self._turn})"
         else:
-            pending_color = wx.Colour(255, 250, 230)     # Yellow tint
-            response_color = wx.Colour(230, 255, 230)    # Green tint
+            pending_color = themes.to_wx(theme.card_primary_header)
+            response_color = themes.to_wx(theme.card_primary_content)
             header_label = f"API Request (Fork {self._fork}, Turn {self._turn})"
 
         self._pending_color = pending_color
@@ -132,9 +139,9 @@ class RequestCard(wx.Panel):
 
         # Add colored left border for conditional and system agent cards
         if self.is_conditional:
-            self.SetForegroundColour(wx.Colour(210, 150, 60))  # Amber accent
+            self.SetForegroundColour(themes.to_wx(themes.active().accent_conditional))
         elif self.is_system_agent:
-            self.SetForegroundColour(wx.Colour(160, 160, 160))  # Gray accent
+            self.SetForegroundColour(themes.to_wx(themes.active().accent_system))
 
         # Request cards (primary and conditional) show Agent/Provider/Model
         # in a right-justified span at the top of the card. The identity
@@ -186,8 +193,8 @@ class RequestCard(wx.Panel):
         self._is_pending = False
         self._header_section.set_indicator("X")
         self._header_section.set_extra("cancelled")
-        self._header_section.set_header_color(wx.Colour(255, 230, 230))
-        self.SetBackgroundColour(wx.Colour(255, 230, 230))
+        self._header_section.set_header_color(themes.to_wx(themes.active().card_cancelled))
+        self.SetBackgroundColour(themes.to_wx(themes.active().card_cancelled))
         self.Layout()
 
     def _stop_pending_timer(self):
@@ -267,8 +274,8 @@ class RequestCard(wx.Panel):
                 label="Content",
                 expanded=not collapsed,
                 indent=20,
-                header_color=wx.Colour(240, 248, 240),
-                content_color=wx.Colour(245, 255, 245)
+                header_color=themes.to_wx(themes.active().response_header),
+                content_color=themes.to_wx(themes.active().response_content)
             )
             self._content_section.add_rich_text(content)
             self._content_area_sizer.Add(self._content_section, 0, wx.EXPAND | wx.ALL, 2)
@@ -281,8 +288,8 @@ class RequestCard(wx.Panel):
                 label="Reasoning",
                 expanded=False,
                 indent=20,
-                header_color=wx.Colour(240, 248, 240),
-                content_color=wx.Colour(245, 255, 245)
+                header_color=themes.to_wx(themes.active().response_header),
+                content_color=themes.to_wx(themes.active().response_content)
             )
             self._reasoning_section.add_rich_text(reasoning)
             self._content_area_sizer.Add(self._reasoning_section, 0, wx.EXPAND | wx.ALL, 2)
@@ -294,20 +301,38 @@ class RequestCard(wx.Panel):
         self._logger.debug('RequestCard.set_response: COMPLETE')
 
     def _add_metadata_footer(self):
-        """Add metadata footer with model info, tokens, timing."""
+        """Create, update, or hide the metadata footer line.
+
+        Idempotent: the footer reflects the currently-enabled API metadata
+        items (View > API Request Card Metadata) so a visibility toggle can re-run
+        against an existing label, and an all-disabled (or empty) footer
+        hides rather than leaving a blank row.
+        """
         meta_str = self._format_metadata(self._metadata)
-        if meta_str:
+        if self._metadata_label is None:
+            if not meta_str:
+                return
             self._metadata_label = wx.StaticText(self, label=meta_str)
-            self._metadata_label.SetForegroundColour(wx.Colour(128, 128, 128))
+            self._metadata_label.SetForegroundColour(themes.to_wx(themes.active().muted_fg))
             self._main_sizer.Add(self._metadata_label, 0, wx.ALIGN_RIGHT | wx.ALL, 5)
+        else:
+            self._metadata_label.SetLabel(meta_str)
+            self._metadata_label.Show(bool(meta_str))
 
     def _format_metadata(self, metadata: dict) -> str:
-        """Format metadata as a footer string."""
+        """Format metadata as a footer string.
+
+        Only the API metadata items currently enabled (View > API
+        Metadata) are included.  The non-API system-agent items (Dir,
+        Success/Failed, Run) are always shown — they are not
+        user-toggleable.
+        """
         parts = []
         is_sys = metadata.get('is_system_agent')
+        visible = self._is_api_metadata_visible
 
         if is_sys:
-            # System agent specific metadata
+            # System agent specific metadata (non-API: always shown)
             if metadata.get('system_agent_subdir'):
                 parts.append(f"Dir: {metadata['system_agent_subdir']}")
             if metadata.get('success') is not None:
@@ -325,21 +350,21 @@ class RequestCard(wx.Panel):
                     pass
             # System agents (scrutinator/summarizer) keep Provider/Model in
             # the footer — their cards are intentionally left unchanged.
-            parts.extend(self._format_model_parts(metadata))
+            parts.extend(self._format_model_parts(metadata, visible))
         # else: request cards (primary and conditional agents) render
         # Agent/Provider/Model in the header's right-justified span
         # (_update_header_identity_span) instead of this footer line, which
         # otherwise truncates on narrow cards.
 
-        if metadata.get('prompt_tokens') is not None:
+        if visible('prompt_tokens') and metadata.get('prompt_tokens') is not None:
             parts.append(f"Prompt: {metadata['prompt_tokens']} tokens")
-        if metadata.get('completion_tokens') is not None:
+        if visible('completion_tokens') and metadata.get('completion_tokens') is not None:
             parts.append(f"Completion: {metadata['completion_tokens']} tokens")
-        if metadata.get('cached_tokens') is not None:
+        if visible('cached_tokens') and metadata.get('cached_tokens') is not None:
             parts.append(f"Cached: {metadata['cached_tokens']} tokens")
-        if metadata.get('reasoning_tokens') is not None:
+        if visible('reasoning_tokens') and metadata.get('reasoning_tokens') is not None:
             parts.append(f"Reasoning: {metadata['reasoning_tokens']} tokens")
-        if metadata.get('end_time') and metadata.get('start_time'):
+        if visible('time') and metadata.get('end_time') and metadata.get('start_time'):
             try:
                 end_time = parse_utc_timestamp(metadata['end_time'])
                 start_time = parse_utc_timestamp(metadata['start_time'])
@@ -352,33 +377,47 @@ class RequestCard(wx.Panel):
         return " | ".join(parts)
 
     @staticmethod
-    def _format_model_parts(metadata: dict) -> List[str]:
-        """Format the Provider/Model fragments of the metadata line."""
+    def _format_model_parts(metadata: dict, visible=None) -> List[str]:
+        """Format the Provider/Model fragments of the metadata line.
+
+        ``visible`` is an optional predicate (item key -> bool) restricting
+        the fragments to the API metadata items the user has enabled; when
+        omitted every fragment is included (legacy behavior).
+        """
+        if visible is None:
+            visible = lambda _key: True
         parts = []
-        if metadata.get('provider'):
+        if visible('provider') and metadata.get('provider'):
             parts.append(f"Provider: {metadata['provider']}")
-        model = metadata.get('model')
-        requested_model = metadata.get('requested_model')
-        if model and requested_model and model != requested_model:
-            parts.append(f"Model: {model} (but requested {requested_model})")
-        elif model:
-            parts.append(f"Model: {model}")
-        elif requested_model:
-            parts.append(f"Model: {requested_model}")
+        if visible('model'):
+            model = metadata.get('model')
+            requested_model = metadata.get('requested_model')
+            if model and requested_model and model != requested_model:
+                parts.append(f"Model: {model} (but requested {requested_model})")
+            elif model:
+                parts.append(f"Model: {model}")
+            elif requested_model:
+                parts.append(f"Model: {requested_model}")
         return parts
 
     @classmethod
-    def _format_identity(cls, metadata: dict) -> str:
+    def _format_identity(cls, metadata: dict, visible=None) -> str:
         """Format the Agent/Provider/Model span for the card header.
 
         The combined identity string is too wide for the metadata footer
         (it truncated there), so it renders in its own right-justified
         span at the top of the card instead.
+
+        ``visible`` is an optional predicate (item key -> bool) restricting
+        the span to the API metadata items the user has enabled; when
+        omitted every fragment is included (legacy behavior).
         """
+        if visible is None:
+            visible = lambda _key: True
         parts = []
-        if metadata.get('agent_type'):
+        if visible('agent') and metadata.get('agent_type'):
             parts.append(f"Agent: {metadata['agent_type']}")
-        parts.extend(cls._format_model_parts(metadata))
+        parts.extend(cls._format_model_parts(metadata, visible))
         return " | ".join(parts)
 
     def _update_header_identity_span(self):
@@ -392,7 +431,17 @@ class RequestCard(wx.Panel):
         if self.is_system_agent or self._metadata.get('is_system_agent'):
             return
         self._header_section.set_right_text(
-            self._format_identity(self._metadata))
+            self._format_identity(self._metadata, self._is_api_metadata_visible))
+
+    def _is_api_metadata_visible(self, key: str) -> bool:
+        """Whether the given API metadata item is enabled (View menu).
+
+        Falls back to showing the item when no AppSettings is wired, so a
+        directly-constructed card keeps the legacy all-visible behavior.
+        """
+        if self._app_settings is None:
+            return True
+        return self._app_settings.is_api_metadata_visible(key)
 
     def add_system_agent_subcard(self, agent_type: str, metadata: dict):
         """Add a system agent subcard within this card's content area.
@@ -407,8 +456,8 @@ class RequestCard(wx.Panel):
             label=f"⚙ {agent_type}",
             expanded=True,
             indent=20,
-            header_color=wx.Colour(252, 252, 252),
-            content_color=wx.Colour(248, 248, 248),
+            header_color=themes.to_wx(themes.active().card_system_header),
+            content_color=themes.to_wx(themes.active().card_system_content),
         )
         subcard.set_indicator("...")
         subcard.set_extra("running")
@@ -416,6 +465,7 @@ class RequestCard(wx.Panel):
         self._system_agent_subcards[agent_type] = {
             'section': subcard,
             'metadata': dict(metadata),
+            'metadata_label': None,
         }
 
         # Insert before the last tool section so the subcard appears above
@@ -449,10 +499,49 @@ class RequestCard(wx.Panel):
             section.set_indicator("OK")
         section.set_extra("")
 
-        meta_str = self._format_metadata(info['metadata'])
-        if meta_str:
-            section.add_rich_text(meta_str)
+        self._render_system_agent_subcard_metadata(info)
 
+        self.Layout()
+
+    def _render_system_agent_subcard_metadata(self, info: dict):
+        """Create, update, or hide one system-agent subcard's metadata line.
+
+        Mirrors the footer: only enabled API metadata items render, and the
+        line is created lazily (the running subcard shows none) then kept in
+        sync by refresh_api_metadata_display() on a View menu toggle.  A
+        plain StaticText (not an HtmlWindow) is used so the line survives a
+        collapse/expand cycle and stays live without re-creating native
+        windows.
+        """
+        meta_str = self._format_metadata(info['metadata'])
+        label = info.get('metadata_label')
+        if label is None:
+            if not meta_str:
+                return
+            section = info['section']
+            label = wx.StaticText(section, label=meta_str)
+            label.SetForegroundColour(themes.to_wx(themes.active().muted_fg))
+            section.get_content_sizer().Add(
+                label, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+            info['metadata_label'] = label
+        else:
+            label.SetLabel(meta_str)
+            label.Show(bool(meta_str))
+        info['section'].Layout()
+
+    def refresh_api_metadata_display(self):
+        """Re-render every metadata surface after a View > API Request Card
+        Metadata toggle.
+
+        Keeps an already-materialized card consistent with the new
+        visibility without a rebuild: the header identity span, the footer
+        line and each system-agent subcard's metadata line are all
+        re-derived from the card's stored metadata.
+        """
+        self._update_header_identity_span()
+        self._add_metadata_footer()
+        for info in self._system_agent_subcards.values():
+            self._render_system_agent_subcard_metadata(info)
         self.Layout()
 
     # -- Tool use handling --
@@ -490,8 +579,8 @@ class RequestCard(wx.Panel):
             label=label,
             expanded=False,
             indent=20,
-            header_color=wx.Colour(255, 250, 200),
-            content_color=wx.Colour(255, 255, 245)
+            header_color=themes.to_wx(themes.active().tool_header_pending),
+            content_color=themes.to_wx(themes.active().tool_content)
         )
         tool_section.set_extra("...")
 
@@ -542,8 +631,8 @@ class RequestCard(wx.Panel):
             label=f"Permission Request: {request.tool_name}",
             expanded=True,
             indent=40,
-            header_color=wx.Colour(255, 240, 230),
-            content_color=wx.Colour(255, 250, 245)
+            header_color=themes.to_wx(themes.active().card_permission_header),
+            content_color=themes.to_wx(themes.active().card_permission_content)
         )
 
         info_text = f"Tool: {request.tool_name}\nReason: {request.reason}"
@@ -555,7 +644,7 @@ class RequestCard(wx.Panel):
 
         # Add approve/deny buttons
         btn_panel = wx.Panel(permission_section.get_content_panel())
-        btn_panel.SetBackgroundColour(wx.Colour(255, 250, 245))
+        btn_panel.SetBackgroundColour(themes.to_wx(themes.active().card_permission_content))
         btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
 
         explanation_ctrl = wx.TextCtrl(btn_panel, value="", style=wx.TE_MULTILINE, size=(-1, 40))
@@ -630,7 +719,7 @@ class RequestCard(wx.Panel):
                     tool_info['permission_section'].collapse()
                 if tool_info.get('section'):
                     tool_info['section'].set_extra("...")
-                    tool_info['section'].set_header_color(wx.Colour(255, 250, 200))
+                    tool_info['section'].set_header_color(themes.to_wx(themes.active().tool_header_pending))
                 found = True
                 break
 
@@ -657,10 +746,10 @@ class RequestCard(wx.Panel):
 
                 if execution_successful:
                     tool_section.set_extra("OK")
-                    tool_section.set_header_color(wx.Colour(230, 255, 230))
+                    tool_section.set_header_color(themes.to_wx(themes.active().tool_header_ok))
                 else:
                     tool_section.set_extra("FAIL")
-                    tool_section.set_header_color(wx.Colour(255, 230, 230))
+                    tool_section.set_header_color(themes.to_wx(themes.active().tool_header_fail))
 
                 # Add result content inside the tool section
                 # Include "Result:" as part of the rich text instead of a separate
@@ -695,11 +784,7 @@ class RequestCard(wx.Panel):
         """Update the metadata footer with new information."""
         self._metadata.update(metadata)
         self._update_header_identity_span()
-        if self._metadata_label:
-            meta_str = self._format_metadata(self._metadata)
-            self._metadata_label.SetLabel(meta_str)
-        else:
-            self._add_metadata_footer()
+        self._add_metadata_footer()
         self.Layout()
 
     def add_report_section(self, report_text: str):
@@ -710,12 +795,13 @@ class RequestCard(wx.Panel):
         conditional card theme.
         """
         # Choose colors based on conditional/primary styling
+        theme = themes.active()
         if self.is_conditional:
-            header_bg = wx.Colour(255, 240, 217)   # Amber yellow
-            content_bg = wx.Colour(255, 245, 230)   # Warm amber tint
+            header_bg = themes.to_wx(theme.report_conditional_header)
+            content_bg = themes.to_wx(theme.report_conditional_content)
         else:
-            header_bg = wx.Colour(255, 250, 200)
-            content_bg = wx.Colour(255, 255, 245)
+            header_bg = themes.to_wx(theme.report_primary_header)
+            content_bg = themes.to_wx(theme.report_primary_content)
 
         report_section = self._new_section(
             'report',

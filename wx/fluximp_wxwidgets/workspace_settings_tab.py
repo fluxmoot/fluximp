@@ -4,7 +4,11 @@ import wx
 from typing import Optional
 
 from fluximp_wxwidgets.workspace import Workspace
-from fluximp_wxwidgets.workflow_config import WorkflowConfigManager, STOCK_WORKFLOW_NAME
+from fluximp_wxwidgets.workflow_config import (
+    WorkflowConfigManager, STOCK_WORKFLOW_NAME, STOCK_WORKFLOWS)
+
+
+from fluximp_wxwidgets import themes
 
 
 class WorkspaceSettingsTab(wx.Panel):
@@ -66,7 +70,8 @@ class WorkspaceSettingsTab(wx.Panel):
         sizer.Add(wx.StaticText(
             self,
             label=f"Created by the 'New {current}' item on the "
-                  f"workspace context menu. Stock workflow: {STOCK_WORKFLOW_NAME}."
+                  f"workspace context menu. Stock workflows: "
+                  f"{', '.join(STOCK_WORKFLOWS)}."
         ), 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
 
         sizer.Add(wx.StaticLine(self), 0, wx.EXPAND | wx.ALL, 10)
@@ -93,9 +98,9 @@ class WorkspaceSettingsTab(wx.Panel):
         # Checked/saved status line.
         self.plugin_dir_status = wx.StaticText(self, label="")
         self._default_status_colour = self.plugin_dir_status.GetForegroundColour()
-        self._fail_colour = wx.Colour(190, 0, 0)
-        self._unchecked_colour = wx.Colour(170, 105, 0)
-        self._saved_colour = wx.Colour(0, 128, 64)
+        self._fail_colour = themes.to_wx(themes.active().settings_fail_fg)
+        self._unchecked_colour = themes.to_wx(themes.active().settings_unchecked_fg)
+        self._saved_colour = themes.to_wx(themes.active().settings_saved_fg)
         sizer.Add(self.plugin_dir_status, 0, wx.LEFT | wx.RIGHT | wx.TOP, 5)
 
         sizer.Add(wx.StaticText(

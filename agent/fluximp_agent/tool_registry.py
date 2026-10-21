@@ -367,7 +367,7 @@ class ToolRegistry:
             if name == "send_message":
                 # Merge tags and format from state_updates into send_message_outputs dict entries
                 tags = state_update.get("send_message_tags", [])
-                format = state_update.get("send_message_format", "plain_text")
+                format = state_update.get("send_message_format", "markdown")
                 state_update["send_message_outputs"] = [{"content": content, "tags": tags, "format": format}]
                 # Remove the individual fields so they don't pollute the state
                 state_update.pop("send_message_tags", None)
@@ -497,7 +497,7 @@ def create_tool_registry(filesystem_service: FileSystemService, agent_config: Ag
     elif experiments_service and experiments_service.is_enabled("edit_line_validation"):
         from fluximp_agent.tools.edit_file_lines import edit_file_lines_tool_validated
         AVAILABLE_TOOLS["edit_file_lines"] = AVAILABLE_TOOLS["edit_file_lines"]._replace(func=edit_file_lines_tool_validated)
-    else:
+    elif experiments_service and experiments_service.is_enabled("edit_line_no_validation"):
         AVAILABLE_TOOLS["edit_file_lines"] = AVAILABLE_TOOLS["edit_file_lines"]._replace(func=edit_file_lines_tool)
     
     # Conditionally assign insert_lines based on experiment
@@ -586,20 +586,31 @@ def create_tool_registry(filesystem_service: FileSystemService, agent_config: Ag
         from fluximp_agent.tools.search import linkup_fetch_tool
         AVAILABLE_TOOLS["linkup_fetch"] = AVAILABLE_TOOLS["linkup_fetch"]._replace(func=linkup_fetch_tool)
 
-    # Conditionally assign parallel_search based on experiment
-    if experiments_service and experiments_service.is_enabled("parallel_search"):
-        from fluximp_agent.tools.search import parallel_search_tool
-        AVAILABLE_TOOLS["parallel_search"] = AVAILABLE_TOOLS["parallel_search"]._replace(func=parallel_search_tool)
+    if False:
+        # Conditionally assign parallel_search based on experiment
+        if experiments_service and experiments_service.is_enabled("parallel_search"):
+            from fluximp_agent.tools.search import parallel_search_tool
+            AVAILABLE_TOOLS["parallel_search"] = AVAILABLE_TOOLS["parallel_search"]._replace(func=parallel_search_tool)
 
-    # Conditionally assign parallel_extract based on experiment
-    if experiments_service and experiments_service.is_enabled("parallel_extract"):
-        from fluximp_agent.tools.search import parallel_extract_tool
-        AVAILABLE_TOOLS["parallel_extract"] = AVAILABLE_TOOLS["parallel_extract"]._replace(func=parallel_extract_tool)
+        # Conditionally assign parallel_extract based on experiment
+        if experiments_service and experiments_service.is_enabled("parallel_extract"):
+            from fluximp_agent.tools.search import parallel_extract_tool
+            AVAILABLE_TOOLS["parallel_extract"] = AVAILABLE_TOOLS["parallel_extract"]._replace(func=parallel_extract_tool)
 
     # Conditionally assign perplexity_search based on experiment
     if experiments_service and experiments_service.is_enabled("perplexity_search"):
         from fluximp_agent.tools.search import perplexity_search_tool
         AVAILABLE_TOOLS["perplexity_search"] = AVAILABLE_TOOLS["perplexity_search"]._replace(func=perplexity_search_tool)
+
+    # Conditionally assign firecrawl_search based on experiment
+    if experiments_service and experiments_service.is_enabled("firecrawl_search"):
+        from fluximp_agent.tools.search import firecrawl_search_tool
+        AVAILABLE_TOOLS["firecrawl_search"] = AVAILABLE_TOOLS["firecrawl_search"]._replace(func=firecrawl_search_tool)
+
+    # Conditionally assign firecrawl_scrape based on experiment
+    if experiments_service and experiments_service.is_enabled("firecrawl_scrape"):
+        from fluximp_agent.tools.search import firecrawl_scrape_tool
+        AVAILABLE_TOOLS["firecrawl_scrape"] = AVAILABLE_TOOLS["firecrawl_scrape"]._replace(func=firecrawl_scrape_tool)
 
     # undo and redo - only assign func if the tool was defined (gated by experiment)
     if "undo" in AVAILABLE_TOOLS:

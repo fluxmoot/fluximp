@@ -197,7 +197,7 @@ def file_io_mode(filesystem_service: FileSystemService, agent_config: AgentConfi
     from fluximp_agent.process_lock import DirLock
     lock = DirLock.acquire(io_path, 'agent', wait_timeout=15.0)
     if lock is None:
-        print(f"ERROR: another Fluximp agent process holds the io "
+        print(f"ERROR: another FluxImp agent process holds the io "
               f"directory lock on {io_path}; not starting.")
         return
     # Create logger with agent_config
@@ -279,16 +279,18 @@ def file_io_mode(filesystem_service: FileSystemService, agent_config: AgentConfi
         except RuntimeError as e:
             print(f"Linkup search service not available: {e}")
 
-        try:
-            from fluximp_agent.search_service_parallel import ParallelSearchService
-            search_services["parallel_search_service"] = ParallelSearchService(
-                filesystem_service=filesystem_service,
-                state_service=state_service,
-                experiments_service=experiment_service,
-                io_path=io_path,
-            )
-        except RuntimeError as e:
-            print(f"Parallel search service not available: {e}")
+        if False:
+            # Disabled for now as their ToS isn't compatible with durable agentic workflows
+            try:
+                from fluximp_agent.search_service_parallel import ParallelSearchService
+                search_services["parallel_search_service"] = ParallelSearchService(
+                    filesystem_service=filesystem_service,
+                    state_service=state_service,
+                    experiments_service=experiment_service,
+                    io_path=io_path,
+                )
+            except RuntimeError as e:
+                print(f"Parallel search service not available: {e}")
 
         try:
             from fluximp_agent.search_service_perplexity import PerplexitySearchService
@@ -302,6 +304,17 @@ def file_io_mode(filesystem_service: FileSystemService, agent_config: AgentConfi
             print(f"Perplexity search service not available: {e}")
 
 
+        try:
+            from fluximp_agent.search_service_firecrawl import FirecrawlSearchService
+            search_services["firecrawl_search_service"] = FirecrawlSearchService(
+                filesystem_service=filesystem_service,
+                state_service=state_service,
+                experiments_service=experiment_service,
+                io_path=io_path,
+            )
+        except RuntimeError as e:
+            print(f"Firecrawl search service not available: {e}")
+
         # Web search/fetch are optional: when an experiment is enabled but the
         # backing service could not be created (e.g. no API key in keyring),
         # drop the corresponding tools instead of failing the whole run.
@@ -310,8 +323,9 @@ def file_io_mode(filesystem_service: FileSystemService, agent_config: AgentConfi
             "exa_search_service": ["exa_search", "exa_contents"],
             "tinyfish_fetch_service": ["tinyfish_fetch", "tinyfish_search"],
             "linkup_search_service": ["linkup_search", "linkup_fetch"],
-            "parallel_search_service": ["parallel_search", "parallel_extract"],
+            #"parallel_search_service": ["parallel_search", "parallel_extract"],
             "perplexity_search_service": ["perplexity_search"],
+            "firecrawl_search_service": ["firecrawl_search", "firecrawl_scrape"],
         }
         for service_key, tool_names in search_service_tool_names.items():
             if service_key in search_services:
@@ -658,7 +672,7 @@ def main() -> int:
     default_provider = get_default_provider_name()
 
     builtin_agent_types = ", ".join(sorted(fs_agents.AGENT_DEFINITIONS.keys()))
-    parser = argparse.ArgumentParser(description="Fluximp Coding Agent POC (LangGraph)")
+    parser = argparse.ArgumentParser(description="FluxImp Agent")
     parser.add_argument("--agent-type", type=str, default="coder",
                         help=f"Set the agent type (default: coder).  Built-in types: {builtin_agent_types}.  Additional types may be available via --agent-config.")
     parser.add_argument("--agent-config", type=str, action="append", default=[],
@@ -745,15 +759,30 @@ def main() -> int:
         model_config = get_model_config(provider=provider, model=model_name)
         assert args.model == args.model
         model_capabilities = get_model_capabilities(model_config)
-        
-        enabled_experiments = {'file_view_windows', 'edit_line_validation', 'insert_line_validation', 'move_line_validation', 'search_list_view', 'line_content_multiline_fix', 'tavily_search', 'tavily_extract', 'exa_search', 'tinyfish_fetch', 'exa_contents', 'tinyfish_search', 'parallel_search', 'parallel_extract', 'perplexity_search'}
-        if not model_capabilities.able_to_use_python_like_protocol_for_tool_function:
-            # Both Minimmax-M2.5 and Minimmax-M2.7 seems to have trouble with levels and would give number of spaces instead
-            #enabled_experiments.add('adjust_indent_validation')
-            enabled_experiments.add('adjust_indent_exact_validation')
-            # And GLM5.1 had issues with leading whitespace using atlascloud.com with the openai compatiable native JSON API
-            enabled_experiments.add('edit_line_validation_first_line_whitespace')            
-            enabled_experiments.add('insert_line_validation_first_line_whitespace')            
+        model_lower = model_config.model.lower()
+
+        enabled_experiments_variant = 2
+        if "minimax-m2" in model_lower or ("glm" in model_lower and ("5.1" in model_lower or "5p1" in model_lower)):
+            enabled_experiments_variant = 1
+        if enabled_experiments_variant == 1:
+            enabled_experiments = {'file_view_windows', 'edit_line_validation', 'insert_line_validation', 'move_line_validation', 'search_list_view', 'line_content_multiline_fix'}
+            if not model_capabilities.able_to_use_python_like_protocol_for_tool_function:
+                # Both Minimmax-M2.5 and Minimmax-M2.7 seems to have trouble with levels and would give number of spaces instead
+                #enabled_experiments.add('adjust_indent_validation')
+                enabled_experiments.add('adjust_indent_exact_validation')
+                # And GLM5.1 had issues with leading whitespace using atlascloud.com with the openai compatiable native JSON API
+                enabled_experiments.add('edit_line_validation_first_line_whitespace')            
+                enabled_experiments.add('insert_line_validation_first_line_whitespace')
+        elif enabled_experiments_variant == 2:
+            enabled_experiments = {'file_view_windows', 'edit_line_validation', 'insert_line_validation', 'move_line_validation', 'adjust_indent_exact_validation', 'search_list_view', 'line_content_multiline_fix'}
+        elif enabled_experiments_variant == 3:
+            enabled_experiments = {'file_view_windows', 'edit_line_validation', 'apply_patch', 'insert_line_validation', 'move_line_validation', 'adjust_indent_exact_validation', 'search_list_view', 'line_content_multiline_fix'}
+        else:
+            # just for testing apply_patch by forcing all edits to use it
+            assert enabled_experiments_variant == 4
+            enabled_experiments = {'file_view_windows', 'apply_patch', 'search_list_view'}
+
+        enabled_experiments |= {'tavily_search', 'tavily_extract', 'exa_search', 'tinyfish_fetch', 'exa_contents', 'tinyfish_search', 'perplexity_search', 'firecrawl_search', 'firecrawl_scrape', 'omit_arg_values', 'failed_tool_prune'}
 
         # With this enabled mimo-v2.5-pro failed to provides its review after 9.6M prompt tokens on a workflow at
         # had been successful on most prior attempts.  On the second try it provided its review after 5.4M prompt
@@ -762,7 +791,6 @@ def main() -> int:
         # Other models didn't have any obvious trouble
         # enabled_experiments.add('close_views')        
 
-        model_lower = model_config.model.lower()
         allow_more_than_one_system_message = True
         if "minimax-m2" in model_lower:
             # While this technically allowed performace seemed to degrade significantly (at least on minimax.io didn't try others)
@@ -805,9 +833,10 @@ def main() -> int:
         if experiments_service.is_enabled('create_file'):
             tool_names_to_drop.append('write_file')
 
-        # TODO re-enable this after getting sorted so that create_aggregate_diff can work with
-        # patches.  For the new file_view_windows experiment the view windows will need to auto-added to.
-        tool_names_to_drop.append('apply_patch')
+        # apply_patch is experimental and off by default; enable it with
+        # --enable-experiment apply_patch.
+        if not experiments_service.is_enabled('apply_patch'):
+            tool_names_to_drop.append('apply_patch')
 
         if experiments_service.is_enabled("file_view_windows"):
             tool_names_to_drop.append('read_file')
@@ -829,6 +858,9 @@ def main() -> int:
             if 'close_view' not in tool_names_to_drop:
                 tool_names_to_drop.append('close_view')
         
+        if not (experiments_service.is_enabled('edit_line_no_validation') or experiments_service.is_enabled('edit_line_validation') or experiments_service.is_enabled('edit_line_validation_first_line_whitespace')):
+            tool_names_to_drop.append('edit_file_lines')
+
         if not (experiments_service.is_enabled('insert_lines') or experiments_service.is_enabled('insert_line_validation')):
             tool_names_to_drop.append('insert_lines')
         
@@ -867,14 +899,20 @@ def main() -> int:
         if not experiments_service.is_enabled('linkup_fetch'):
             tool_names_to_drop.append('linkup_fetch')
 
-        if not experiments_service.is_enabled('parallel_search'):
+        if True: #not experiments_service.is_enabled('parallel_search'):
             tool_names_to_drop.append('parallel_search')
 
-        if not experiments_service.is_enabled('parallel_extract'):
+        if True: #not experiments_service.is_enabled('parallel_extract'):
             tool_names_to_drop.append('parallel_extract')
 
         if not experiments_service.is_enabled('perplexity_search'):
             tool_names_to_drop.append('perplexity_search')
+
+        if not experiments_service.is_enabled('firecrawl_search'):
+            tool_names_to_drop.append('firecrawl_search')
+
+        if not experiments_service.is_enabled('firecrawl_scrape'):
+            tool_names_to_drop.append('firecrawl_scrape')
 
         # redo depends on undo - can't have redo without undo
         if experiments_service.is_enabled('redo') and not experiments_service.is_enabled('undo'):

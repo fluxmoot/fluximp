@@ -1,4 +1,4 @@
-"""Workspace management for Fluximp agents."""
+"""Workspace management for FluxImp agents."""
 
 from fluximp_agent import fs_agents
 import hashlib
@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from fluximp_agent.model_config import create_provider, get_default_provider_name
 from fluximp_wxwidgets.global_state import get_global_state
 from fluximp_wxwidgets.conversation_manager import Conversation
-from fluximp_wxwidgets.workflow_config import STOCK_WORKFLOW_NAME
+from fluximp_wxwidgets.workflow_config import STOCK_WORKFLOW_NAME, canonical_workflow_name
 
 
 @dataclass
@@ -22,7 +22,7 @@ class ConversationStub:
     conversation_dir: Path
     start_time: datetime
     workspace: 'Workspace'
-    workflow_name: str = "Dev Workflow"
+    workflow_name: str = STOCK_WORKFLOW_NAME
 
 
 class Workspace:
@@ -86,14 +86,16 @@ class Workspace:
                 except (OSError, ValueError):
                     start_time = datetime.now(timezone.utc)
 
-                # Read workflow_name from config if available
-                workflow_name = "Dev Workflow"
+                # Read workflow_name from config if available (legacy names
+                # such as "Dev Workflow" are canonicalised)
+                workflow_name = STOCK_WORKFLOW_NAME
                 config_path = conv_dir / ".config.json"
                 if config_path.exists():
                     try:
                         with open(config_path, 'r', encoding='utf-8') as f:
                             cfg = json.load(f)
-                            workflow_name = cfg.get('workflow_name', 'Dev Workflow')
+                            workflow_name = canonical_workflow_name(
+                                cfg.get('workflow_name', STOCK_WORKFLOW_NAME))
                     except (json.JSONDecodeError, IOError):
                         pass
 
@@ -134,14 +136,16 @@ class Workspace:
                 except (OSError, ValueError):
                     start_time = datetime.now(timezone.utc)
 
-                # Read workflow_name from config if available
-                workflow_name = "Dev Workflow"
+                # Read workflow_name from config if available (legacy names
+                # such as "Dev Workflow" are canonicalised)
+                workflow_name = STOCK_WORKFLOW_NAME
                 config_path = conv_dir / ".config.json"
                 if config_path.exists():
                     try:
                         with open(config_path, 'r', encoding='utf-8') as f:
                             cfg = json.load(f)
-                            workflow_name = cfg.get('workflow_name', 'Dev Workflow')
+                            workflow_name = canonical_workflow_name(
+                                cfg.get('workflow_name', STOCK_WORKFLOW_NAME))
                     except (json.JSONDecodeError, IOError):
                         pass
 
@@ -216,7 +220,7 @@ class Workspace:
 
     def get_default_workflow(self) -> str:
         """Workflow created by the tree's 'New <workflow>' context-menu item."""
-        return self.default_workflow or STOCK_WORKFLOW_NAME
+        return canonical_workflow_name(self.default_workflow or STOCK_WORKFLOW_NAME)
 
     def set_default_workflow(self, workflow_name: Optional[str]) -> None:
         """Set the workspace's default workflow (persisted in config.json)."""
@@ -266,7 +270,7 @@ class Workspace:
         config['test_runner_plugin_dir'] = self.test_runner_plugin_dir
         self.config_file.write_text(json.dumps(config, indent=2))
 
-    def create_conversation(self, workflow_name: str = "Dev Workflow",
+    def create_conversation(self, workflow_name: str = STOCK_WORKFLOW_NAME,
                            agent_type: str = "developer",
                            max_requests: int = 100000) -> ConversationStub:
         """Create a new conversation in this workspace."""

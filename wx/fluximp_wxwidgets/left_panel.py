@@ -1,13 +1,19 @@
-"""Left panel - Tabbed workspace/workflow management for Fluximp GUI."""
+"""Left panel - Tabbed workspace/workflow management for FluxImp GUI."""
 
 import wx
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Callable
 
 from fluximp_wxwidgets.workspace import WorkspaceManager, Workspace, ConversationStub
 from fluximp_wxwidgets.conversation_manager import Conversation
+from fluximp_wxwidgets.conversation_grouping import (
+    group_conversations_by_month,
+    month_label,
+)
 from fluximp_wxwidgets.workflow_config import WorkflowConfigManager
 from fluximp_wxwidgets.workflow_panel import WorkflowPanel
+from fluximp_wxwidgets.icon_bitmaps import icon_bundle
 
 
 class WorkspaceTreeCtrl(wx.TreeCtrl):
@@ -16,6 +22,7 @@ class WorkspaceTreeCtrl(wx.TreeCtrl):
     # Tree item data types
     TYPE_WORKSPACE = "workspace"
     TYPE_CONVERSATION = "conversation"
+    TYPE_MONTH = "month"
     
     def __init__(self, parent, manager: WorkspaceManager):
         super().__init__(parent, style=wx.TR_DEFAULT_STYLE | wx.TR_HIDE_ROOT)
@@ -23,10 +30,18 @@ class WorkspaceTreeCtrl(wx.TreeCtrl):
         self.manager = manager
         
         # Image list for icons
-        self.img_list = wx.ImageList(16, 16)
-        self.img_folder = self.img_list.Add(self._create_folder_bitmap())
-        self.img_chat = self.img_list.Add(self._create_chat_bitmap())
-        self.SetImageList(self.img_list)
+        # Icons: transparent and DPI-aware (see icon_bitmaps).  SetImages
+        # takes a wx.BitmapBundle per image, so the tree scales them for a
+        # HiDPI display instead of showing a fixed 16 physical pixels; the
+        # indices below are what AppendItem's image= parameter takes.
+        self.SetImages([
+            icon_bundle(self._draw_folder),
+            icon_bundle(self._draw_chat),
+            icon_bundle(self._draw_calendar),
+        ])
+        self.img_folder = 0
+        self.img_chat = 1
+        self.img_calendar = 2
         
         # Root is hidden
         self.root = self.AddRoot("Workspaces")
@@ -47,30 +62,42 @@ class WorkspaceTreeCtrl(wx.TreeCtrl):
         # Build initial tree
         self._refresh_tree()
     
-    def _create_folder_bitmap(self) -> wx.Bitmap:
-        """Create a simple folder icon bitmap."""
-        bmp = wx.Bitmap(16, 16)
-        dc = wx.MemoryDC(bmp)
-        dc.SetBackground(wx.Brush(wx.Colour(240, 240, 240)))
-        dc.Clear()
-        dc.SetPen(wx.Pen(wx.Colour(180, 180, 180)))
-        dc.SetBrush(wx.Brush(wx.Colour(255, 220, 100)))
-        dc.DrawRoundedRectangle(2, 4, 12, 10, 2)
-        dc.SelectObject(wx.NullBitmap)
-        return bmp
+    @staticmethod
+    def _draw_folder(gc) -> None:
+        """Paint the folder icon into a 16x16 logical box.
+
+        No background is painted: the bitmap is transparent (see
+        icon_bitmaps), so whatever is not drawn here shows the tree's own
+        colour through, which is what lets one icon work on a light and on a
+        dark tree.
+        """
+        gc.SetPen(wx.Pen(wx.Colour(180, 180, 180)))
+        gc.SetBrush(wx.Brush(wx.Colour(255, 220, 100)))
+        gc.DrawRoundedRectangle(2, 4, 12, 10, 2)
+
+    @staticmethod
+    def _draw_chat(gc) -> None:
+        """Paint the chat icon into a 16x16 logical box (see _draw_folder)."""
+        gc.SetPen(wx.Pen(wx.Colour(100, 150, 220)))
+        gc.SetBrush(wx.Brush(wx.Colour(150, 200, 255)))
+        gc.DrawEllipse(2, 2, 12, 10)
     
-    def _create_chat_bitmap(self) -> wx.Bitmap:
-        """Create a simple chat icon bitmap."""
-        bmp = wx.Bitmap(16, 16)
-        dc = wx.MemoryDC(bmp)
-        dc.SetBackground(wx.Brush(wx.Colour(240, 240, 240)))
-        dc.Clear()
-        dc.SetPen(wx.Pen(wx.Colour(100, 150, 220)))
-        dc.SetBrush(wx.Brush(wx.Colour(150, 200, 255)))
-        dc.DrawEllipse(2, 2, 12, 10)
-        dc.SelectObject(wx.NullBitmap)
-        return bmp
-    
+    @staticmethod
+    def _draw_calendar(gc) -> None:
+        """Paint a calendar icon into a 16x16 logical box (see _draw_folder).
+
+        Used for the YYYY-MM month nodes that collect older conversations.
+        """
+        gc.SetPen(wx.Pen(wx.Colour(150, 150, 150)))
+        gc.SetBrush(wx.Brush(wx.Colour(235, 235, 240)))
+        gc.DrawRoundedRectangle(2, 3, 12, 11, 2)
+        # Header band and the two binding rings above it.
+        gc.SetBrush(wx.Brush(wx.Colour(150, 170, 220)))
+        gc.DrawRectangle(3, 4, 10, 3)
+        gc.SetPen(wx.Pen(wx.Colour(150, 150, 150)))
+        gc.StrokeLine(5, 2, 5, 4)
+        gc.StrokeLine(11, 2, 11, 4)
+
     def _refresh_tree(self):
         """Refresh the entire tree from the manager."""
         self.DeleteChildren(self.root)
@@ -79,27 +106,56 @@ class WorkspaceTreeCtrl(wx.TreeCtrl):
             self._add_workspace_node(workspace)
     
     def _add_workspace_node(self, workspace: Workspace) -> wx.TreeItemId:
-        """Add a workspace node to the tree."""
+        """Add a workspace node and its conversations to the tree.
+
+        Conversations are listed newest-first.  Recent ones (current UTC
+        month, plus the previous UTC month early in the month) sit directly
+        under the workspace; everything older is collected into collapsed
+        YYYY-MM month nodes, newest month first.
+        """
         item = self.AppendItem(self.root, workspace.name, image=self.img_folder)
         self.SetItemData(item, (self.TYPE_WORKSPACE, workspace))
 
         # Add conversation stubs (lightweight, not full conversations)
+        stubs = []
         for conv_id in workspace.get_conversation_ids():
             stub = workspace.conversations.get(conv_id)
             if stub:
-                self._add_conversation_node(item, stub)
+                stubs.append(stub)
+
+        recent, month_groups = group_conversations_by_month(
+            stubs, datetime.now(timezone.utc))
+
+        for stub in recent:
+            self._add_conversation_node(item, stub)
+
+        for key, month_stubs in month_groups:
+            month_item = self._add_month_node(item, key, len(month_stubs))
+            for stub in month_stubs:
+                self._add_conversation_node(month_item, stub)
 
         return item
     
+    def _conversation_label(self, stub: ConversationStub) -> str:
+        """Return the tree label for a conversation stub."""
+        timestamp = stub.start_time.strftime("%Y-%m-%d %H:%M")
+        return f"{stub.workflow_name} {timestamp}"
+
     def _add_conversation_node(self, parent: wx.TreeItemId,
                                 stub: ConversationStub) -> wx.TreeItemId:
-        """Add a conversation stub node under a workspace."""
-        # Format timestamp nicely
-        timestamp = stub.start_time.strftime("%Y-%m-%d %H:%M")
-        label = f"{stub.workflow_name} {timestamp}"
-
-        item = self.AppendItem(parent, label, image=self.img_chat)
+        """Add a conversation stub node under a workspace or month node."""
+        item = self.AppendItem(parent, self._conversation_label(stub),
+                               image=self.img_chat)
         self.SetItemData(item, (self.TYPE_CONVERSATION, stub))
+        return item
+
+    def _add_month_node(self, parent: wx.TreeItemId, key: str,
+                        count: int) -> wx.TreeItemId:
+        """Add a collapsed YYYY-MM month node under a workspace."""
+        item = self.AppendItem(parent, month_label(key, count),
+                               image=self.img_calendar)
+        self.SetItemData(item, (self.TYPE_MONTH, key))
+        # AppendItem leaves the node collapsed, which is what we want.
         return item
     
     def add_workspace(self, workspace: Workspace):
@@ -107,13 +163,20 @@ class WorkspaceTreeCtrl(wx.TreeCtrl):
         self._add_workspace_node(workspace)
     
     def add_conversation(self, workspace: Workspace, stub: ConversationStub):
-        """Add a new conversation stub to the tree."""
+        """Add a new conversation stub to the tree.
+
+        A freshly created conversation is always in the current month, so it
+        is a "recent" entry and belongs at the very top of the workspace's
+        children - above any older recent entries and above the month nodes.
+        """
         # Find the workspace node
         item, cookie = self.GetFirstChild(self.root)
         while item.IsOk():
             data = self.GetItemData(item)
             if data and data[0] == self.TYPE_WORKSPACE and data[1] == workspace:
-                self._add_conversation_node(item, stub)
+                new_item = self.PrependItem(item, self._conversation_label(stub),
+                                            image=self.img_chat)
+                self.SetItemData(new_item, (self.TYPE_CONVERSATION, stub))
                 self.Expand(item)
                 return
             item, cookie = self.GetNextChild(self.root, cookie)
@@ -122,10 +185,31 @@ class WorkspaceTreeCtrl(wx.TreeCtrl):
         """Remove a conversation node from the tree."""
         item = self._find_conversation_item(stub)
         if item and item.IsOk():
-            self.Delete(item)
+            self._delete_conversation_node(item)
+
+    def _delete_conversation_node(self, item: wx.TreeItemId):
+        """Delete a conversation node, pruning a month node left empty.
+
+        A conversation sits either directly under its workspace (a "recent"
+        entry) or inside a YYYY-MM month node; in the latter case an emptied
+        month node is removed too, so the tree keeps no empty groups.
+        """
+        parent = self.GetItemParent(item)
+        self.Delete(item)
+        if parent.IsOk():
+            parent_data = self.GetItemData(parent)
+            if parent_data and parent_data[0] == self.TYPE_MONTH:
+                first_child, _ = self.GetFirstChild(parent)
+                if not first_child.IsOk():
+                    self.Delete(parent)
 
     def _find_conversation_item(self, stub: ConversationStub) -> Optional[wx.TreeItemId]:
-        """Find the tree item for a conversation stub."""
+        """Find the tree item for a conversation stub.
+
+        Conversation nodes live either directly under a workspace (the
+        "recent" entries) or one level deeper inside a YYYY-MM month node,
+        so both levels are searched.
+        """
         item, cookie = self.GetFirstChild(self.root)
         while item.IsOk():
             child, child_cookie = self.GetFirstChild(item)
@@ -133,6 +217,14 @@ class WorkspaceTreeCtrl(wx.TreeCtrl):
                 data = self.GetItemData(child)
                 if data and data[0] == self.TYPE_CONVERSATION and data[1] == stub:
                     return child
+                if data and data[0] == self.TYPE_MONTH:
+                    grandchild, gc_cookie = self.GetFirstChild(child)
+                    while grandchild.IsOk():
+                        gdata = self.GetItemData(grandchild)
+                        if (gdata and gdata[0] == self.TYPE_CONVERSATION
+                                and gdata[1] == stub):
+                            return grandchild
+                        grandchild, gc_cookie = self.GetNextChild(child, gc_cookie)
                 child, child_cookie = self.GetNextChild(item, child_cookie)
             item, cookie = self.GetNextChild(self.root, cookie)
         return None
@@ -218,6 +310,7 @@ class WorkspaceTreeCtrl(wx.TreeCtrl):
             self._show_workspace_menu(item, item_data, event.GetPoint())
         elif item_type == self.TYPE_CONVERSATION:
             self._show_conversation_menu(item, item_data, event.GetPoint())
+        # TYPE_MONTH nodes are containers only: no context menu.
     
     def _show_workspace_menu(self, item: wx.TreeItemId, workspace: Workspace, 
                              position: wx.Point):
@@ -365,7 +458,7 @@ class WorkspaceTreeCtrl(wx.TreeCtrl):
                 if stub.conversation_id in workspace.conversations:
                     workspace.delete_conversation(stub.conversation_id)
                     break
-            self.Delete(item)
+            self._delete_conversation_node(item)
 
         dlg.Destroy()
 

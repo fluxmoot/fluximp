@@ -111,8 +111,8 @@ class AgentNode(BaseAgentNode):
         
         Unlike the previous single-slot approach, this does NOT clear old positions.
         All historical omission transformers remain active until their positions
-        are overwritten by SummaryTransformer/DropTransformer (during summarization)
-        or pruned (after a fork).
+        are overwritten by SummaryTransformer/DropTransformer (during summarization
+        or failed_tool_prune) or pruned (after a fork).
         
         The one-turn delay is handled by the pending_tool_call_omission_transformer
         field: new transformers are stored there and only promoted to the dict
@@ -770,7 +770,14 @@ class AgentNode(BaseAgentNode):
         if len(self.transformers) == 0 and len(messages) > 0:
             print("DEBUG _sync_transformers: full rebuild")
             self._rebuild_transformers(state)
-            self._scan_for_drop_opportunities(state)
+            # _scan_for_drop_opportunities is deliberately not called here:
+            # _prepare_for_invoke always rebuilds (line 731-733) before this
+            # point, so this branch is unreachable in practice, and the scan runs
+            # on every normal _sync_transformers pass below. Even if it did run,
+            # a missed scan would only delay a prune by one request.
+            # Attach omission transformers before computing placements so the
+            # manager sees the current turn's active omission positions.
+            self._attach_tool_call_omission_transformer(state)
             self._update_context_injections(state)
             return
         
@@ -783,11 +790,13 @@ class AgentNode(BaseAgentNode):
         # Scan for new drop-transformer opportunities (only newly added positions)
         self._scan_for_drop_opportunities(state)
         
+        # Attach tool call omission transformers FIRST, so _update_context_injections
+        # can see this turn's active omission positions (promoted from the pending
+        # transformer in the previous turn) when deciding where to place context.
+        self._attach_tool_call_omission_transformer(state)
+
         # Reposition context injection transformer to last tool message position
         self._update_context_injections(state)
-        
-        # Attach tool call omission transformer for the AI message with last_valid_calls
-        self._attach_tool_call_omission_transformer(state)
     
     def _rebuild_transformers(self, state: AgentState):
         """Full rebuild of transformers list when resuming from checkpoint or fork.
@@ -796,6 +805,7 @@ class AgentNode(BaseAgentNode):
         - SystemPromptTransformer at index 0 (ignores placeholder, returns actual system prompt)
         - SummaryTransformer + DropTransformers from state["summarized_ranges"]
         - ToolCallOmissionTransformer instances from state["tool_call_omission_transformers"]
+          are attached afterwards by _attach_tool_call_omission_transformer, not here
         - None for all other messages (pass through)
         """
         messages = state["messages"]
@@ -827,19 +837,13 @@ class AgentNode(BaseAgentNode):
                 for i in range(start_idx + 1, end_idx + 1):
                     self.transformers[i] = DropTransformer(source="summarization_rebuild")
         
-        # Reconstruct ToolCallOmissionTransformers from durable state dict
-        # Skip positions that already have a SummaryTransformer or DropTransformer
+        # ToolCallOmissionTransformers are NOT attached here. The shared
+        # _attach_tool_call_omission_transformer (which skips positions that
+        # already hold a SummaryTransformer or DropTransformer) runs on the
+        # _sync_transformers pass that follows every rebuild, so the two attach
+        # paths cannot diverge.
         active_omission_transformers = state.get("tool_call_omission_transformers", {})
         self._tool_call_omission_positions = set()
-        for msg_index, omission_transformer in active_omission_transformers.items():
-            if msg_index < len(messages) and isinstance(messages[msg_index], AIMessage):
-                # Skip if position already has a SummaryTransformer or DropTransformer
-                if msg_index < len(self.transformers) and isinstance(self.transformers[msg_index], (SummaryTransformer, DropTransformer)):
-                    continue
-                while len(self.transformers) <= msg_index:
-                    self.transformers.append(None)
-                self.transformers[msg_index] = omission_transformer
-                self._tool_call_omission_positions.add(msg_index)
         
         # Reset scanned positions
         self._drop_scanned_positions = set()
@@ -854,7 +858,7 @@ class AgentNode(BaseAgentNode):
             print("DEBUG _rebuild_transformers: skipping context injection restore due to fork")
         self._skip_context_injection_restore = False
         
-        print(f"DEBUG _rebuild_transformers: built {len(self.transformers)} transformers with {len(summarized_ranges)} summaries and {len(self._tool_call_omission_positions)} omission transformers from state")
+        print(f"DEBUG _rebuild_transformers: built {len(self.transformers)} transformers with {len(summarized_ranges)} summaries and {len(active_omission_transformers)} omission transformers from state (attached by _attach_tool_call_omission_transformer)")
     
     def _is_content_carrying_tool(self, tool_name: str) -> bool:
         """True if the tool has a string-typed arg tagged 'message' or 'content'.
@@ -875,114 +879,195 @@ class AgentNode(BaseAgentNode):
             for arg in tool_def.args
         )
 
+    def _failed_tool_prune_enabled(self) -> bool:
+        """Return True when the 'failed_tool_prune' experiment is active.
+
+        A registry without an experiments service (e.g. lightweight test
+        registries) is treated as enabled so the historical always-on
+        behavior is preserved.
+        """
+        experiments_service = getattr(self.registry, '_experiments_service', None)
+        if experiments_service is None:
+            return True
+        return experiments_service.is_enabled('failed_tool_prune')
+    
     def _scan_for_drop_opportunities(self, state: AgentState):
         """Scan for new drop-transformer opportunities.
-        
-        Looks for consecutive (AIMessage, tool_results) pairs where all tool results
-        have execution_successful=False, following a successful send_message.
-        
-        Only scans positions that haven't been scanned yet.
+
+        Prunes an (AIMessage, tool_results) batch from history when the whole
+        batch failed and every call is content-carrying (see _CONTENT_ARG_TAGS
+        and _is_content_carrying_tool): the substantive content of such a tool is
+        preserved elsewhere (file views / cumulative diff for file tools, or the
+        user-facing text for send_message), so the failed attempt can be removed
+        from history once the model has seen it.
+
+        The trigger is unified and deferral-based - it does NOT depend on a
+        successful send_message anywhere in the history:
+
+          * The AI message at index i first appears in the request after the one
+            that produced it, and a later AI message can only exist after that
+            request's response was received, so requiring "a later AIMessage
+            exists" installs the drop on the request after the LLM's single
+            verbatim view of the call. The failure (its error text) disappears
+            at that same request.
+          * Because the scan runs before _attach_tool_call_omission_transformer
+            in _sync_transformers, the omission transformer that would otherwise
+            rewrite this message's args is never attached - the drop replaces it
+            - so there is a single byte transition (present -> absent) and no
+            dead omission entry is left in state.
+
+        Tool names come from additional_kwargs['fluximp_valid_tool_calls'] (what
+        the parse node actually executed) when present, falling back to
+        msg.tool_calls, so the rule also covers the text protocol, where the
+        calls live in content/reasoning and tool_calls stays empty.
+
+        Only scans positions that haven't been scanned yet. A position whose
+        decision can still change (the batch's results do not exist yet, no later
+        AI message exists yet, or dropping would leave no live tool result) is
+        left unmarked so it is reconsidered on the next request.
         """
-        messages = state["messages"]
-        
-        # Find the last successful send_message tool result position
-        last_successful_send_message_idx = None
-        for i in range(len(messages) - 1, -1, -1):
-            msg = messages[i]
-            is_successful_result = isinstance(msg, ToolMessage) and getattr(msg, 'execution_successful', True)
-            if is_successful_result:
-                # Check if this was from a send_message tool call
-                # Walk backwards to find the corresponding AIMessage
-                for j in range(i - 1, -1, -1):
-                    prev_msg = messages[j]
-                    if isinstance(prev_msg, AIMessage):
-                        tool_calls = getattr(prev_msg, 'tool_calls', None)
-                        if tool_calls:
-                            for tc in tool_calls:
-                                if tc.get('name') == 'send_message':
-                                    last_successful_send_message_idx = i
-                                    break
-                        if last_successful_send_message_idx is not None:
-                            break
-                if last_successful_send_message_idx is not None:
-                    break
-        
-        if last_successful_send_message_idx is None:
-            # No successful send_message found
+        if not self._failed_tool_prune_enabled():
             return
         
-        # Now scan backwards from the successful send_message result
-        # Looking for consecutive failed pairs
-        for i in range(last_successful_send_message_idx - 1, -1, -1):
-            msg = messages[i]
-            
+        messages = state["messages"]
+        
+        # Index of the newest AI message. Its batch has not been sent to the LLM
+        # yet, so pruning it now would rob the model of its single verbatim view
+        # of the failed call.
+        last_ai_idx = None
+        for i in range(len(messages) - 1, -1, -1):
+            if isinstance(messages[i], AIMessage):
+                last_ai_idx = i
+                break
+        
+        for ai_msg_idx, msg in enumerate(messages):
             # Skip already scanned positions
-            if i in self._drop_scanned_positions:
+            if ai_msg_idx in self._drop_scanned_positions:
                 continue
             
-            # Check if this is an AIMessage we haven't processed
-            if isinstance(msg, AIMessage):
-                # Skip positions that already have a SummaryTransformer or ToolCallOmissionTransformer
-                # (preserved from before fork â don't overwrite them)
-                if i < len(self.transformers) and isinstance(self.transformers[i], (SummaryTransformer, ToolCallOmissionTransformer)):
-                    self._drop_scanned_positions.add(i)
+            if not isinstance(msg, AIMessage):
+                continue
+            
+            # A SummaryTransformer replaces the message (dropping it would delete
+            # the summary) and an existing DropTransformer means it is already
+            # pruned, so both decisions are final.
+            if ai_msg_idx < len(self.transformers) and isinstance(
+                    self.transformers[ai_msg_idx], (SummaryTransformer, DropTransformer)):
+                self._drop_scanned_positions.add(ai_msg_idx)
+                continue
+            
+            # Tool names for this batch. The text protocol (and any provider that
+            # returns the calls inside content/reasoning instead of tool_calls)
+            # leaves msg.tool_calls empty, so prefer the calls the parse node
+            # actually executed, recorded in
+            # additional_kwargs['fluximp_valid_tool_calls'] - the same source
+            # _check_and_run_summarization uses. The stash is present but empty
+            # when the response had no valid calls, which correctly leaves the
+            # batch non-prune-eligible.
+            stashed_calls = getattr(msg, 'additional_kwargs', {}).get('fluximp_valid_tool_calls')
+            if stashed_calls is not None:
+                tool_names = [name for name, _args in stashed_calls]
+            else:
+                tool_names = [tc.get('name', '') for tc in (getattr(msg, 'tool_calls', None) or [])]
+            if not tool_names:
+                self._drop_scanned_positions.add(ai_msg_idx)
+                continue
+            
+            # Find all tool results following this AIMessage
+            tool_result_indices = []
+            for j in range(ai_msg_idx + 1, len(messages)):
+                next_msg = messages[j]
+                if isinstance(next_msg, AIMessage):
+                    break
+                is_tool_result = isinstance(next_msg, ToolMessage)
+                if is_tool_result:
+                    tool_result_indices.append(j)
+            
+            if not tool_result_indices:
+                # The results have not been produced yet (mid-turn) or the turn
+                # was abandoned. Defer without marking so the position is
+                # reconsidered once the results exist.
+                continue
+            
+            # Check if ALL tool results have execution_successful=False
+            all_failed = True
+            for tr_idx in tool_result_indices:
+                is_successful = getattr(messages[tr_idx], 'execution_successful', True)
+                if is_successful:
+                    all_failed = False
+                    break
+            
+            if not all_failed:
+                # The results are final, so this decision is stable.
+                self._drop_scanned_positions.add(ai_msg_idx)
+                continue
+            
+            # Only prune failed pairs for content-carrying tools.
+            # Non-content tools (e.g. run_python_script, run_tests)
+            # can surface diagnostics or user redirects in their
+            # results that must remain in the model's view.
+            # (tool_names was derived above from the stashed executed calls when
+            # present, so text-protocol batches are covered too)
+            all_content = all(
+                self._is_content_carrying_tool(name) for name in tool_names)
+            if not all_content:
+                self._drop_scanned_positions.add(ai_msg_idx)
+                continue
+            
+            # One-verbatim-send rule: the batch must already have been sent to the
+            # LLM once, which is exactly when a later AI message exists.
+            if last_ai_idx is None or ai_msg_idx >= last_ai_idx:
+                continue
+            
+            # The file views / cumulative diff are injected at the last live
+            # (non-dropped) tool result (_update_context_injections), so never
+            # install a drop that would leave no live tool result behind.
+            live_result_elsewhere = False
+            for j, other in enumerate(messages):
+                if not isinstance(other, ToolMessage):
                     continue
-                tool_calls = getattr(msg, 'tool_calls', None)
-                if not tool_calls:
+                if j in tool_result_indices:
                     continue
-                
-                # Find all tool results following this AIMessage
-                ai_msg_idx = i
-                next_ai_idx = None
-                tool_result_indices = []
-                
-                for j in range(i + 1, len(messages)):
-                    next_msg = messages[j]
-                    if isinstance(next_msg, AIMessage):
-                        next_ai_idx = j
-                        break
-                    is_tool_result = isinstance(next_msg, ToolMessage)
-                    if is_tool_result:
-                        tool_result_indices.append(j)
-                
-                # Check if ALL tool results have execution_successful=False
-                if tool_result_indices:
-                    all_failed = True
-                    for tr_idx in tool_result_indices:
-                        tr_msg = messages[tr_idx]
-                        is_successful = isinstance(tr_msg, ToolMessage) and getattr(tr_msg, 'execution_successful', True)
-                        if is_successful:
-                            all_failed = False
-                            break
-                    
-                    if all_failed:
-                        # Only prune failed pairs for content-carrying tools.
-                        # Non-content tools (e.g. run_python_script, run_tests)
-                        # can surface diagnostics or user redirects in their
-                        # results that must remain in the model's view.
-                        tool_names = [tc.get('name', '') for tc in tool_calls]
-                        all_content = bool(tool_names) and all(
-                            self._is_content_carrying_tool(name) for name in tool_names)
-                        if not all_content:
-                            self._drop_scanned_positions.add(i)
-                            continue
-
-                        # Install drop transformers
-                        print(f"DEBUG _scan_for_drop_opportunities: installing drop transformers at {ai_msg_idx} and {tool_result_indices}")
-                        
-                        # Make sure we have enough transformer slots
-                        max_idx = max(ai_msg_idx, max(tool_result_indices)) + 1
-                        while len(self.transformers) < max_idx:
-                            self.transformers.append(None)
-                        
-                        # Install DropTransformer at AIMessage position
-                        self.transformers[ai_msg_idx] = DropTransformer(source="failed_tool_prune")
-                        self._drop_scanned_positions.add(ai_msg_idx)
-                        
-                        # Install DropTransformer at all tool result positions
-                        for tr_idx in tool_result_indices:
-                            self.transformers[tr_idx] = DropTransformer(source="failed_tool_prune")
-                            self._drop_scanned_positions.add(tr_idx)
+                if j < len(self.transformers) and isinstance(self.transformers[j], DropTransformer):
+                    continue
+                live_result_elsewhere = True
+                break
+            if not live_result_elsewhere:
+                continue
+            
+            # Install drop transformers
+            print(f"DEBUG _scan_for_drop_opportunities: installing drop transformers at {ai_msg_idx} and {tool_result_indices}")
+            
+            # Make sure we have enough transformer slots
+            max_idx = max(ai_msg_idx, max(tool_result_indices)) + 1
+            while len(self.transformers) < max_idx:
+                self.transformers.append(None)
+            
+            # Install DropTransformer at the AIMessage position. This position may
+            # already hold a ToolCallOmissionTransformer attached on an earlier
+            # request; the drop takes precedence, which is what makes this a prune
+            # instead of an omit (mirroring _attach_tool_call_omission_transformer,
+            # which yields to a drop).
+            self.transformers[ai_msg_idx] = DropTransformer(source="failed_tool_prune")
+            self._drop_scanned_positions.add(ai_msg_idx)
+            
+            # Install DropTransformer at all tool result positions
+            for tr_idx in tool_result_indices:
+                self.transformers[tr_idx] = DropTransformer(source="failed_tool_prune")
+                self._drop_scanned_positions.add(tr_idx)
+            
+            # The omission transformer for this position is now dead (the whole
+            # message is dropped), so remove it from the active dict as well:
+            # leaving it behind would persist it in the checkpoint and re-attach
+            # it on the next rebuild.
+            active_omission = state.get("tool_call_omission_transformers") or {}
+            if ai_msg_idx in active_omission:
+                updated_omission = dict(active_omission)
+                del updated_omission[ai_msg_idx]
+                state["tool_call_omission_transformers"] = updated_omission
+                self._pending_tool_call_omission_transformers_update = updated_omission
+                self._tool_call_omission_positions.discard(ai_msg_idx)
+                print(f"DEBUG _scan_for_drop_opportunities: removed dead omission transformer entry at {ai_msg_idx}")
     
     def _update_context_injections(self, state: AgentState):
         """Update context injection transformers based on current context chunks.
@@ -1057,9 +1142,35 @@ class AgentNode(BaseAgentNode):
         for i in range(len(self.transformers)):
             if isinstance(self.transformers[i], DropTransformer):
                 dropped_indices.add(i)
-        
+
+        # Compute the other structural-break positions the manager needs to detect
+        # a prefix break it cannot see from injection content alone:
+        #  - omission_indices: AI messages whose args are rewritten in place by a
+        #    ToolCallOmissionTransformer (a mid-history byte change).
+        #  - summary_indices: positions replaced by a SummaryTransformer.
+        #  - valid_tool_indices: positions that are still live (non-dropped)
+        #    ToolMessages, so the manager can detect an injection record whose
+        #    target message was dropped or otherwise moved.
+        omission_indices = set()
+        summary_indices = set()
+        for i in range(len(self.transformers)):
+            if isinstance(self.transformers[i], ToolCallOmissionTransformer):
+                omission_indices.add(i)
+            elif isinstance(self.transformers[i], SummaryTransformer):
+                summary_indices.add(i)
+        valid_tool_indices = {
+            i for i, m in enumerate(messages)
+            if isinstance(m, ToolMessage) and i not in dropped_indices
+        }
+
         # Use the manager to determine placements
-        placements = self.context_injection_manager.get_placements(chunks, last_tool_result_idx, seconds_since_last_response, dropped_indices=dropped_indices)
+        placements = self.context_injection_manager.get_placements(
+            chunks, last_tool_result_idx, seconds_since_last_response,
+            dropped_indices=dropped_indices,
+            omission_indices=omission_indices,
+            summary_indices=summary_indices,
+            valid_tool_indices=valid_tool_indices,
+        )
         
         # Check if system prompt context injection experiment is enabled
         use_system_prompt_injection = self.registry._experiments_service and self.registry._experiments_service.is_enabled(
@@ -1242,6 +1353,15 @@ class AgentNode(BaseAgentNode):
         provider is rigid about id matching. Other configs (including
         use_tool_message_for_no_tool_error=True and the text protocol) are left
         untouched.
+
+        Note on prefix caching: stripping does NOT break the prefix cache in the
+        normal flow. An AI message is only ever sent after its tool batch has
+        run, so a call is never "present at first send, dangling later"; an
+        abandoned turn leaves its calls dangling permanently, so the stripped
+        output is identical on every request that includes the message. No
+        transition => no break. (Contrast ToolCallOmissionTransformer, which is
+        deliberately attached one turn AFTER the AI message was first sent
+        verbatim -- that delay is what creates a real transition.)
         """
         if not (self.use_api_protocol and not self.agent_config.use_tool_message_for_no_tool_error):
             return api_messages
@@ -1352,7 +1472,7 @@ class AgentNode(BaseAgentNode):
         # so the prefix cache is preserved across agent type changes
         if (self.registry._experiments_service and
             self.registry._experiments_service.is_enabled('two_part_system_prompt')):
-            cache_key = self.thread_id_ref[0] + 'dev_workflow'
+            cache_key = self.thread_id_ref[0] + '_shared'
         else:
             cache_key = self.thread_id_ref[0] + self.agent_config.agent_type
         print("DEBUG cache_key", cache_key)
@@ -1374,7 +1494,7 @@ class AgentNode(BaseAgentNode):
         # so the prefix cache is preserved across agent type changes
         if (self.registry._experiments_service and
             self.registry._experiments_service.is_enabled('two_part_system_prompt')):
-            cache_key = self.thread_id_ref[0] + 'dev_workflow'
+            cache_key = self.thread_id_ref[0] + '_shared'
         else:
             cache_key = self.thread_id_ref[0] + self.agent_config.agent_type
         print("DEBUG cache_key", cache_key)

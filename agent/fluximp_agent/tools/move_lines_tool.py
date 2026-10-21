@@ -12,6 +12,7 @@ from typing import Dict, Any, Optional
 import uuid
 
 from fluximp_agent.tools.common import FileOperation, compress, lines_match
+from fluximp_agent.filesystem_service import check_line_mode_file_size
 from fluximp_agent.tools.tool_definitions import ToolResult
 from fluximp_agent.tool_call_omission import OMISSION_PLACEHOLDER_RE
 
@@ -71,6 +72,9 @@ def move_lines_tool(file_path: str, start_line: int, end_line: int,
     if not src_path.exists() or not src_path.is_file():
         return ToolResult(success=False, content=f"Error: Source file '{file_path}' not found")
 
+    size_error = check_line_mode_file_size(src_path, file_path)
+    if size_error:
+        return ToolResult(success=False, content=size_error)
     # Read source file content
     try:
         src_content = src_path.read_text(encoding='utf-8')
@@ -208,6 +212,9 @@ def move_lines_tool(file_path: str, start_line: int, end_line: int,
             dest_lines = []
             dest_total_lines = 0
         else:
+            size_error = check_line_mode_file_size(dest_path, dest_file_path)
+            if size_error:
+                return ToolResult(success=False, content=size_error)
             # Read destination file content
             try:
                 dest_content = dest_path.read_text(encoding='utf-8')
@@ -383,6 +390,9 @@ def move_lines_tool_validated(file_path: str, start_line: int, start_line_conten
     if not src_path.exists() or not src_path.is_file():
         return ToolResult(success=False, content=f"Error: Source file '{file_path}' not found")
 
+    size_error = check_line_mode_file_size(src_path, file_path)
+    if size_error:
+        return ToolResult(success=False, content=size_error)
     # Read source file content
     try:
         src_content = src_path.read_text(encoding='utf-8')
@@ -502,6 +512,9 @@ def move_lines_tool_validated(file_path: str, start_line: int, start_line_conten
             dest_lines = []
             dest_total_lines = 0
         else:
+            size_error = check_line_mode_file_size(dest_path, dest_file_path)
+            if size_error:
+                return ToolResult(success=False, content=size_error)
             try:
                 dest_content = dest_path.read_text(encoding='utf-8')
             except Exception as e:

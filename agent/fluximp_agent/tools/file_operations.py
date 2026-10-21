@@ -1,7 +1,6 @@
 """File operation reversal, application, and recording.
 
 Provides the low-level machinery for undo/redo and time travel:
-- _reverse_patch: swap + and - lines in a unified diff
 - reverse_operation: reverse a single FileOperation on disk
 - apply_operation: apply or reverse a FileOperation in a given direction
 - new_operation: record a new FileOperation in agent state
@@ -11,35 +10,10 @@ from typing import Optional, Tuple
 
 from fluximp_agent.tools.common import FileOperation, decompress
 from fluximp_agent.tools.filesystem_modify import _delete_file, _write_file
-from fluximp_agent.tools.apply_patch import _apply_unified_diff
 from fluximp_agent.filesystem_service import FileSystemService
 from fluximp_agent.fs_agent_state import AgentState
 
 
-def _reverse_patch(patch: str) -> str:
-    """Reverse a unified diff patch by swapping + and - lines.
-
-    Args:
-        patch: Unified diff format patch text
-
-    Returns:
-        Reversed patch with + and - swapped
-    """
-    lines = patch.splitlines(keepends=True)
-    reversed_lines = []
-
-    for line in lines:
-        if line.startswith('+') and not line.startswith('+++'):
-            # Changed line to add -> remove
-            reversed_lines.append('-' + line[1:])
-        elif line.startswith('-') and not line.startswith('---'):
-            # Changed line to remove -> add
-            reversed_lines.append('+' + line[1:])
-        else:
-            # Keep header lines and context lines as-is
-            reversed_lines.append(line)
-
-    return ''.join(reversed_lines)
 
 
 # ============================================================================
@@ -105,13 +79,11 @@ def reverse_operation(op: FileOperation, state: AgentState, filesystem_service: 
             return _write_file(op.file_path, decompress(op.compressed_before), filesystem_service)
         return (True, None)
     elif op.operation_type == "apply_patch":
-        # Reverse the patch by swapping + and - lines
-        if op.patch:
-            reversed_patch = _reverse_patch(op.patch)
-            success, error, _ = _apply_unified_diff(reversed_patch, filesystem_service)
-            if not success:
-                return (False, error)
-        return (True, None)
+        # Restore the file's pre-patch content, or delete it if it didn't exist
+        # before the patch. Content-based, like the other editing tools.
+        if op.compressed_before:
+            return _write_file(op.file_path, decompress(op.compressed_before), filesystem_service)
+        return _delete_file(op.file_path, filesystem_service)
     elif op.operation_type in ["undo", "redo"]:
         # Skip undo/redo operations
         return (True, None)
@@ -209,20 +181,15 @@ def apply_operation(op: FileOperation, direction: str, filesystem_service: FileS
             return (True, None)
     elif op.operation_type == "apply_patch":
         if direction == "forward":
-            # Apply the patch
-            if op.patch:
-                success, error, _ = _apply_unified_diff(op.patch, filesystem_service)
-                if not success:
-                    return (False, error)
-            return (True, None)
+            # Use compressed_after when going forward (delete if file was removed)
+            if op.compressed_after:
+                return _write_file(op.file_path, decompress(op.compressed_after), filesystem_service)
+            return _delete_file(op.file_path, filesystem_service)
         else:
-            # Reverse the patch
-            if op.patch:
-                reversed_patch = _reverse_patch(op.patch)
-                success, error, _ = _apply_unified_diff(reversed_patch, filesystem_service)
-                if not success:
-                    return (False, error)
-            return (True, None)
+            # Use compressed_before when going backward
+            if op.compressed_before:
+                return _write_file(op.file_path, decompress(op.compressed_before), filesystem_service)
+            return _delete_file(op.file_path, filesystem_service)
     elif op.operation_type in ["undo", "redo"]:
         # Skip undo/redo operations
         return (True, None)

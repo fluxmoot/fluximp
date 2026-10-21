@@ -1,4 +1,4 @@
-# Conditional agent infrastructure for Fluximp.
+# Conditional agent infrastructure for FluxImp.
 #
 # Provides agent config classes and entry points for conditional agents:
 # - ConditionalFilesystemAgent: For readonly_filesystem tool_set (uses filesystem agent infrastructure)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Scope-directory liveness locks for Fluximp processes.
+"""Scope-directory liveness locks for FluxImp processes.
 
-Exactly one Fluximp process of a given kind may own a scope directory at a
+Exactly one FluxImp process of a given kind may own a scope directory at a
 time, and "does anything own it right now?" is answerable exactly, without
 PID bookkeeping:
 

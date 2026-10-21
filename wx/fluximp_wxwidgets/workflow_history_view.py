@@ -21,6 +21,8 @@ from fluximp_wxwidgets.workflow_history_controller import (
 )
 
 
+from fluximp_wxwidgets import themes
+
 logger = logging.getLogger(__name__)
 
 
@@ -28,11 +30,15 @@ class WorkflowHistoryView(wx.ScrolledWindow):
     """Owns the history sizer, materializes items, and handles layout/scroll."""
 
     MIN_CARD_WIDTH = 520
-    # §8.2: 25px left indent for conditional-agent / system-agent cards.
-    # Every row is card_w wide: the widget is sized card_w - INDENT_OFFSET
-    # and the indent (the sizer border — see _sizer_flags/_sizer_border)
-    # carries the rest of the row.
-    INDENT_OFFSET = 25
+    # §8.2 card indents: every card row carries a left indent, and that
+    # indent IS the row's sizer border (see _sizer_flags/_sizer_border).
+    # Primary API Request cards take the shallower 20px indent; the
+    # conditional-agent / system-agent cards (the amber ``-> name`` cards
+    # and the scrutinator/summarizer-type ⚙ cards) take the deeper 40px
+    # one.  Every row stays card_w wide: the widget is sized
+    # card_w - indent and the indent carries the rest of the row.
+    PRIMARY_INDENT_OFFSET = 20
+    AGENT_INDENT_OFFSET = 40
     # F-A7/F-A9: the thumb is "parked" when no genuine THUMBTRACK arrives
     # for this many milliseconds while the drag stays latched — a
     # reading-paced drag re-arms the window continuously (its sparse gaps
@@ -96,9 +102,13 @@ class WorkflowHistoryView(wx.ScrolledWindow):
     _sizer_dump_count = 0
     _sizer_dump_suppressed = False
 
-    def __init__(self, parent, logger: Optional[logging.Logger] = None):
+    def __init__(self, parent, logger: Optional[logging.Logger] = None,
+                 app_settings=None):
         super().__init__(parent, style=wx.VSCROLL)
         self._logger = logger or logging.getLogger(__name__)
+        # App-wide settings, forwarded to every RequestCard so the
+        # View > API Request Card Metadata visibility toggles are honoured.
+        self._app_settings = app_settings
         self.SetScrollRate(5, 5)
 
         self._controller = None
@@ -233,6 +243,25 @@ class WorkflowHistoryView(wx.ScrolledWindow):
     def get_widget(self, item_id):
         return self._widgets_by_id.get(item_id)
 
+    def refresh_api_metadata_display(self):
+        """Re-render metadata on every materialized request card.
+
+        Called when the View > API Request Card Metadata submenu changes so
+        already-built cards reflect the new visibility without a rebuild.
+        Detached-cache members (hidden but registered) are refreshed too
+        and flagged via mark_out_of_band_mutation so their recorded heights
+        reconverge on the next flush.
+        """
+        for item_id, widget in list(self._widgets_by_id.items()):
+            if not isinstance(widget, RequestCard):
+                continue
+            try:
+                widget.refresh_api_metadata_display()
+            except (RuntimeError, WX_FAILURES):
+                continue
+            if item_id in self._demat_cache:
+                self.mark_out_of_band_mutation(item_id)
+
     def materialized_item_ids(self):
         """Ids of currently materialized items (windowed flush policy loop)."""
         return list(self._widgets_by_id.keys())
@@ -301,6 +330,7 @@ class WorkflowHistoryView(wx.ScrolledWindow):
             is_system_agent=item.is_system_agent,
             system_agent_type=item.system_agent_type,
             logger=self._logger,
+            app_settings=self._app_settings,
             pos=pos,
         )
 
@@ -505,7 +535,7 @@ class WorkflowHistoryView(wx.ScrolledWindow):
             for i in range(len(self._sizer_order), n):
                 item = items[i]
                 iid = item.item_id
-                if first <= i <= last:
+                if first <= i <= last and not getattr(item, 'suppressed', False):
                     widget = self.materialize(item)
                     if widget is not None and iid in self._demat_cache:
                         # Guard layer: a widget Added LIVE here can never
@@ -542,7 +572,7 @@ class WorkflowHistoryView(wx.ScrolledWindow):
     def _reconcile_states(self, items, first, last):
         for i, item in enumerate(items):
             iid = item.item_id
-            in_range = first <= i <= last
+            in_range = first <= i <= last and not getattr(item, 'suppressed', False)
             widget = self._widgets_by_id.get(iid)
             if in_range:
                 if widget is not None:
@@ -635,7 +665,7 @@ class WorkflowHistoryView(wx.ScrolledWindow):
         self._sizer_order = []
         for i, item in enumerate(items):
             iid = item.item_id
-            in_range = first <= i <= last
+            in_range = first <= i <= last and not getattr(item, 'suppressed', False)
             if in_range:
                 widget = self._widgets_by_id.get(iid)
                 if widget is not None:
@@ -1501,6 +1531,11 @@ class WorkflowHistoryView(wx.ScrolledWindow):
         host-birth + Reparent variant hard-crashed natively on the first
         post-load band rebuild (see the F-A7 crash-fix comment below).
         """
+        if getattr(item, 'suppressed', False):
+            # View > API Request Card toggle (off): a suppressed card is never
+            # materialized — routing mutations land on the model and replay
+            # when the toggle shows the card again.
+            return None
         iid = item.item_id
         widget = self._widgets_by_id.get(iid)
         if widget is not None:
@@ -1750,6 +1785,10 @@ class WorkflowHistoryView(wx.ScrolledWindow):
                 self._sync_html_heights(child)
 
     def _height_for_item(self, item) -> int:
+        if item is not None and getattr(item, 'suppressed', False):
+            # View > API Request Card toggle (off): a suppressed card's row
+            # collapses to zero height (no controller needed for the gate).
+            return 0
         if self._controller is not None:
             try:
                 return self._controller.height_for_item(item)
@@ -1757,27 +1796,37 @@ class WorkflowHistoryView(wx.ScrolledWindow):
                 pass
         return 120
 
-    def _is_indented_card(self, item) -> bool:
-        """§8.2 / §2.1: conditional-agent and system-agent cards (the amber
-        ``-> name`` cards, and scrutinator/summarizer-type ⚙ cards) take the
-        25px left indent — the pre-refactor appearance the plan keeps.
+    def _card_indent(self, item) -> Optional[int]:
+        """§8.2 / §2.1: the left indent for a card row, None for a panel.
+
+        Every API Request card is indented: the conditional-agent and
+        system-agent cards (the amber ``-> name`` cards, and
+        scrutinator/summarizer-type ⚙ cards) take the deeper 40px indent,
+        the primary cards the shallower 20px one.  MessagePanels and error
+        panels are not cards and carry no indent — their 2px ``wx.ALL``
+        margin is the row's whole horizontal border.
         """
-        return (item.item_id.kind == 'card'
-                and (item.is_conditional or item.is_system_agent))
+        if item is None or item.item_id.kind != 'card':
+            return None
+        if item.is_conditional or item.is_system_agent:
+            return self.AGENT_INDENT_OFFSET
+        return self.PRIMARY_INDENT_OFFSET
 
     def _widget_width(self, iid, item, card_w: int) -> int:
         """Widget width for one row at ``card_w`` (§8.2 width policy).
 
-        Every row is ``card_w`` wide: indented (conditional/system) widgets
-        are sized ``card_w - INDENT_OFFSET`` — the 25px left indent carries
-        the rest of the row — MessagePanels are sized ``card_w - 4`` (row =
-        widget + 2px ``wx.ALL``), and primary cards are ``card_w``.
-        ``item`` may be None from registry lookups; the kind then decides.
+        Every row is ``card_w`` wide: a card widget is sized ``card_w -
+        indent`` — its left indent (20px primary, 40px conditional/system)
+        carries the rest of the row — and MessagePanels are sized
+        ``card_w - 4`` (row = widget + 2px ``wx.ALL``).  ``item`` may be
+        None from registry lookups; the kind then decides, and an unknown
+        card takes the shallower primary indent.
         """
-        if item is not None and self._is_indented_card(item):
-            return card_w - self.INDENT_OFFSET
+        indent = self._card_indent(item)
+        if indent is not None:
+            return card_w - indent
         if iid.kind == 'card':
-            return card_w
+            return card_w - self.PRIMARY_INDENT_OFFSET
         return card_w - 4
 
     def _item_width(self, item) -> int:
@@ -1789,25 +1838,23 @@ class WorkflowHistoryView(wx.ScrolledWindow):
         return self._widget_width(item.item_id, item, card_w)
 
     def _sizer_flags(self, item) -> int:
-        # §8.2: for an indented card the 25px left indent IS the sizer
-        # border (row = widget + indent, so every row stays card_w wide).
-        # A sizer item carries one border value for every side its flags
-        # name, so the indent cannot combine with the primary cards' 2px
-        # TOP/BOTTOM borders; indented rows take the indent alone and get
+        # §8.2: for a card the left indent IS the sizer border (row =
+        # widget + indent, so every row stays card_w wide). A sizer item
+        # carries one border value for every side its flags name, so the
+        # indent cannot combine with the 2px TOP/BOTTOM margins the card
+        # rows used to carry; card rows take the indent alone and get
         # their vertical separation from their neighbors' borders and the
-        # card's own internal header padding.
-        if self._is_indented_card(item):
+        # card's own internal padding. Panels keep the 2px all-round
+        # margin.
+        if item is not None and item.item_id.kind == 'card':
             return wx.EXPAND | wx.LEFT
-        if item.item_id.kind == 'card':
-            return wx.EXPAND | wx.TOP | wx.BOTTOM
         return wx.EXPAND | wx.ALL
 
     def _sizer_border(self, item) -> int:
-        """Border for the item's sizer entry: the indent for indented
-        cards (§8.2 row = widget + indent), the 2px margin elsewhere."""
-        if self._is_indented_card(item):
-            return self.INDENT_OFFSET
-        return 2
+        """Border for the item's sizer entry: the row's left indent for a
+        card (§8.2 row = widget + indent), the 2px margin elsewhere."""
+        indent = self._card_indent(item)
+        return indent if indent is not None else 2
 
     def refresh_spacer_heights(self):
         """Re-apply every offscreen spacer's height (§8.5)."""
@@ -2672,7 +2719,7 @@ class MessagePanel(wx.Panel):
         header_sizer.Add(self.role_label, 0, wx.RIGHT, 5)
 
         fork_turn_label = wx.StaticText(self, label=f"Fork {message.fork}, Turn {message.turn}")
-        fork_turn_label.SetForegroundColour(wx.Colour(128, 128, 128))
+        fork_turn_label.SetForegroundColour(themes.to_wx(themes.active().muted_fg))
         header_sizer.Add(fork_turn_label, 0)
 
         header_sizer.AddStretchSpacer(1)
@@ -2750,7 +2797,7 @@ class MessagePanel(wx.Panel):
             meta_str = self._format_metadata(message.metadata)
             if meta_str:
                 self.meta_label = wx.StaticText(self, label=meta_str)
-                self.meta_label.SetForegroundColour(wx.Colour(128, 128, 128))
+                self.meta_label.SetForegroundColour(themes.to_wx(themes.active().muted_fg))
                 sizer.Add(self.meta_label, 0, wx.ALIGN_RIGHT | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         self.Layout()
 
@@ -2758,41 +2805,45 @@ class MessagePanel(wx.Panel):
         """Set up colors based on message role."""
         # Complementary border colors for User and Assistant
         self.border_color: Optional[wx.Colour] = None
-        
+
+        theme = themes.active()
         roles = {
-            'user': (wx.Colour(230, 240, 255), wx.Colour(50, 100, 150)),
-            'assistant': (wx.Colour(220, 245, 220), wx.Colour(30, 120, 30)),  # Darker green
-            'tool_result': (wx.Colour(255, 255, 230), wx.Colour(150, 150, 50)),
-            'permission_request': (wx.Colour(255, 240, 230), wx.Colour(200, 100, 50)),
+            'user': (themes.to_wx(theme.msg_user_bg), themes.to_wx(theme.msg_user_fg)),
+            'assistant': (themes.to_wx(theme.msg_assistant_bg), themes.to_wx(theme.msg_assistant_fg)),
+            'tool_result': (themes.to_wx(theme.msg_tool_result_bg), themes.to_wx(theme.msg_tool_result_fg)),
+            'permission_request': (themes.to_wx(theme.msg_permission_bg), themes.to_wx(theme.msg_permission_fg)),
         }
+        # Fallback for an unrecognised role/status (theme's plain body).
+        default_colours = (themes.to_wx(theme.msg_default_bg),
+                           themes.to_wx(theme.msg_default_fg))
 
         # Set complementary border colors for User and Assistant
         if self.message.role == 'user':
-            self.border_color = wx.Colour(204, 85, 0)  # Burnt orange (complement to blue)
+            self.border_color = themes.to_wx(theme.msg_user_border)
         elif self.message.role == 'assistant':
-            self.border_color = wx.Colour(199, 21, 133)  # Deep magenta (complement to green)
+            self.border_color = themes.to_wx(theme.msg_assistant_border)
 
         # Tool messages have dynamic colors based on status
         if self.message.role == 'tool':
             status = self.message.metadata.get('status', 'pending')
             if status == 'pending':
-                self.bg_color = wx.Colour(255, 250, 200)  # Light yellow
-                self.role_color = wx.Colour(200, 150, 50)  # Orange
+                self.bg_color = themes.to_wx(theme.msg_tool_pending_bg)
+                self.role_color = themes.to_wx(theme.msg_tool_pending_fg)
             elif status == 'completed':
                 # Check execution_successful from metadata (boolean)
                 execution_successful = self.message.metadata.get('execution_successful')
                 if not execution_successful:
-                    self.bg_color = wx.Colour(255, 230, 230)  # Light red
-                    self.role_color = wx.Colour(200, 50, 50)  # Red
+                    self.bg_color = themes.to_wx(theme.msg_tool_fail_bg)
+                    self.role_color = themes.to_wx(theme.msg_tool_fail_fg)
                 else:
-                    self.bg_color = wx.Colour(230, 255, 230)  # Light green
-                    self.role_color = wx.Colour(50, 150, 50)  # Green
+                    self.bg_color = themes.to_wx(theme.msg_tool_ok_bg)
+                    self.role_color = themes.to_wx(theme.msg_tool_ok_fg)
             else:
-                self.bg_color, self.role_color = roles.get('tool_result',
-                                                           (wx.Colour(255, 255, 255), wx.Colour(0, 0, 0)))
+                self.bg_color, self.role_color = roles.get(
+                    'tool_result', default_colours)
         else:
-            self.bg_color, self.role_color = roles.get(self.message.role,
-                                                       (wx.Colour(255, 255, 255), wx.Colour(0, 0, 0)))
+            self.bg_color, self.role_color = roles.get(
+                self.message.role, default_colours)
 
     def _format_tool_content(self, message: ConversationMessage) -> str:
         """Format tool message content based on status."""
@@ -2859,7 +2910,7 @@ class MessagePanel(wx.Panel):
                 if self.meta_label is None:
                     # Create metadata label if it doesn't exist
                     self.meta_label = wx.StaticText(self, label=meta_str)
-                    self.meta_label.SetForegroundColour(wx.Colour(128, 128, 128))
+                    self.meta_label.SetForegroundColour(themes.to_wx(themes.active().muted_fg))
                     # Need to add to sizer - find the main content sizer
                     sizer = self.GetSizer()
                     if sizer and isinstance(sizer, wx.BoxSizer):
@@ -2907,10 +2958,11 @@ class MessagePanel(wx.Panel):
             escaped = html_lib.escape(text)
             body = escaped.replace('\n', '<br>\n')
         bg_hex = self.bg_color.GetAsString(wx.C2S_HTML_SYNTAX)
+        fg_hex = themes.to_wx(themes.active().text_fg).GetAsString(wx.C2S_HTML_SYNTAX)
 
         html_content = (
             f'<html><body bgcolor="{bg_hex}">'
-            f'<font face="sans-serif" size="3">{body}</font>'
+            f'<font face="sans-serif" size="3" color="{fg_hex}">{body}</font>'
             f'</body></html>'
         )
 

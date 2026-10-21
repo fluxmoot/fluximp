@@ -1,4 +1,4 @@
-"""Main application entry point for Fluximp GUI."""
+"""Main application entry point for FluxImp GUI."""
 
 import wx
 import wx.adv
@@ -16,9 +16,14 @@ from keyring.errors import KeyringError
 
 from fluximp_agent.model_config import get_provider_names
 from fluximp_agent.curated_models import filter_provider_names
-from fluximp_wxwidgets.main_frame import MainFrame
+from fluximp_wxwidgets.main_frame import MainFrame, apply_appearance
 from fluximp_wxwidgets.app_settings import AppSettings
+from fluximp_wxwidgets import themes
 from fluximp_wxwidgets.app_settings_tab import NoCuratedProvidersDialog
+from fluximp_wxwidgets.workflow_config import (
+    migrate_legacy_stock_workflow,
+    LegacyWorkflowConflictError,
+)
 
 
 # Keyring identifier for a provider's API key. Not a real username: every
@@ -77,7 +82,45 @@ class NoApiKeyDialog(wx.Dialog):
         self.CentreOnScreen()
 
 
-class FluximpGuiApp(wx.App):
+class LegacyWorkflowConflictDialog(wx.Dialog):
+    """Modal shown when both dev_workflow.json and coding.json exist.
+
+    The legacy primary stock-workflow override file (dev_workflow.json) and
+    its renamed replacement (coding.json) both exist, so FluxImp cannot tell
+    which one the user wants.  Closing this dialog exits the GUI.
+    """
+
+    def __init__(self, parent, error: LegacyWorkflowConflictError):
+        super().__init__(parent, title="Conflicting Workflow Files")
+
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        sizer.Add(
+            wx.StaticText(
+                self,
+                label=(
+                    "Both of these workflow config files exist:\n\n"
+                    f"    {error.legacy_path}\n"
+                    f"    {error.current_path}\n\n"
+                    "FluxImp cannot tell which one you want.  Compare the two "
+                    "files, set coding.json the way you want it, then delete "
+                    "dev_workflow.json."
+                ),
+            ),
+            0, wx.ALL, 12,
+        )
+
+        btns = wx.StdDialogButtonSizer()
+        ok_btn = wx.Button(self, wx.ID_OK, "Close")
+        ok_btn.SetDefault()
+        btns.AddButton(ok_btn)
+        btns.Realize()
+        sizer.Add(btns, 0, wx.ALIGN_RIGHT | wx.ALL, 12)
+
+        self.SetSizerAndFit(sizer)
+        self.CentreOnScreen()
+
+
+class FluxImpGuiApp(wx.App):
     """Main wxPython application."""
     
     def __init__(self, base_dir: Path):
@@ -142,6 +185,18 @@ class FluximpGuiApp(wx.App):
         # the curated-provider gate below can read and persist them.
         app_settings = AppSettings(self.base_dir)
 
+        # Apply the persisted theme before the frame is built so the first
+        # paint is already themed (widgets resolve colors at construction).
+        themes.set_active(app_settings.theme)
+
+        # Ask wx for the matching native light/dark appearance.  This is the
+        # only route to the surfaces no widget color call reaches -- the title
+        # bar, the native menu bar and the standard controls inside the panes
+        # -- and it must be requested before any window exists, so it goes
+        # here rather than in MainFrame (a theme switch re-requests it).
+        # A no-op on wx < 4.3, where the API does not exist.
+        apply_appearance(app_settings.theme)
+
         # Gate startup on the curated filter leaving at least one provider with
         # an API key set. Without a provider the GUI can do nothing useful, so
         # offer to turn the filter off or exit - mirroring the no-API-key gate
@@ -156,10 +211,22 @@ class FluximpGuiApp(wx.App):
                 return False
             app_settings.limit_providers_and_models_to_curated = False
 
+        # Migrate the legacy primary stock-workflow override file
+        # (dev_workflow.json -> coding.json) before the frame exists.  If both
+        # files exist the ambiguity must be resolved by hand, so surface it in
+        # a dialog and exit without ever creating the main window.
+        try:
+            migrate_legacy_stock_workflow(self.base_dir / "workflows")
+        except LegacyWorkflowConflictError as e:
+            dlg = LegacyWorkflowConflictDialog(None, e)
+            dlg.ShowModal()
+            dlg.Destroy()
+            return False
+
         logging.info(f"Creating MainFrame")
 
         # Create main frame with base directory
-        frame = MainFrame(title="Fluximp", base_dir=self.base_dir,
+        frame = MainFrame(title="FluxImp", base_dir=self.base_dir,
                           app_settings=app_settings)
         # Restrict the Provider combo to providers that have an API key set
         # (and, when enabled, the curated set).
@@ -180,7 +247,7 @@ def main():
     else:
         default_display = "~/.fluximp"
 
-    parser = argparse.ArgumentParser(description="Fluximp GUI")
+    parser = argparse.ArgumentParser(description="FluxImp GUI")
     parser.add_argument(
         "--base-dir",
         type=Path,
@@ -199,7 +266,7 @@ def main():
     from fluximp_agent.process_lock import DirLock, probe
     base_dir = args.base_dir.resolve()
     message = (
-        f"A Fluximp GUI is already running for base directory "
+        f"A FluxImp GUI is already running for base directory "
         f"'{base_dir}'. Exiting."
     )
     if probe(base_dir, 'gui') == 'held':
@@ -212,7 +279,7 @@ def main():
         print(message)
         sys.exit(1)
 
-    app = FluximpGuiApp(base_dir=base_dir)
+    app = FluxImpGuiApp(base_dir=base_dir)
     # Keep the single-instance lock referenced for the process lifetime
     # (the OS releases it at process exit, crash included).
     app._single_instance_lock = gui_lock

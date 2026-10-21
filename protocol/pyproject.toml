@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fluximp-protocol"
-version = "0.2.0"
+version = "0.3.0"
 description = "FluxImp Protocol: the communication protocol between the FluxImp Agent and FluxImp GUI"
 readme = "README.md"
 authors = [

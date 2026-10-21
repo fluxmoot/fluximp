@@ -105,7 +105,7 @@ class ProcessService:
             FileNotFoundError: If script does not exist
             PermissionDeniedError: If permission is denied by user
         """
-        print("DEBUG ProcessService.run_python_script")
+        print(f"DEBUG ProcessService.run_python_script script_path={script_path!r} args={args!r} timeout={timeout}")
         
         # Validate reason is provided
         if not reason:
@@ -118,6 +118,21 @@ class ProcessService:
         # Default timeout is 10 seconds
         if timeout is None:
             timeout = 10.0
+        
+        # Validate the script path up front, before any expensive work such as
+        # running the scrutinator, so a bad or non-existent path fails fast.
+        validated_path, error = self._filesystem_service.validate_path(script_path)
+        if error:
+            raise ToolError(f"Invalid script path: {error}")
+        
+        # Restrict to .py files only
+        if validated_path.suffix.lower() != '.py':
+            raise ToolError(f"Only .py files can be executed. Got: {validated_path.suffix}")
+        
+        # Check file exists
+        if not validated_path.exists():
+            raise ToolError(f"Script not found: {validated_path}")
+        print(f"DEBUG ProcessService: validated script_path -> {validated_path}")
         
         # Check if there's already a pending permission request (resume scenario)
         # If so, skip scrutinator to avoid duplicate analysis
@@ -159,7 +174,7 @@ class ProcessService:
             if syntax_errors:
                 raise ToolError("Syntax validation failed:\n" + "\n".join(syntax_errors))
             else:
-                script_is_new = state_service.is_newly_created_file(script_path)
+                script_is_new = state_service.is_newly_created_file(str(validated_path))
                 print(f"DEBUG ProcessService: script_is_new={script_is_new}")
 
                 if script_is_new:
@@ -180,17 +195,6 @@ class ProcessService:
                                 request_data["security_analysis"] = scrutinator_report
         else:
             print(f"DEBUG ProcessService: Found pending permission request, skipping scrutinator")
-        validated_path, error = self._filesystem_service.validate_path(script_path)
-        if error:
-            raise ToolError(f"Invalid script path: {error}")
-        
-        # Restrict to .py files only
-        if validated_path.suffix.lower() != '.py':
-            raise ToolError(f"Only .py files can be executed. Got: {validated_path.suffix}")
-        
-        # Check file exists
-        if not validated_path.exists():
-            raise ToolError(f"Script not found: {validated_path}")
         
         # Add scrutinator report or error to permission request
         # This ensures user knows if security analysis failed or found issues

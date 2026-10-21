@@ -1,4 +1,4 @@
-"""Workflow and agent configuration management for Fluximp GUI.
+"""Workflow and agent configuration management for FluxImp GUI.
 
 Manages workflow configs and agent configs stored in the ~/.fluximp directory.
 Stock workflows and agents are defined in code (fs_agents.py) and have no
@@ -86,8 +86,90 @@ class AgentConfigInfo:
 
 
 
-STOCK_WORKFLOW_NAME = "Dev Workflow"
-STOCK_WORKFLOW_AGENTS = sorted(fs_agents.AGENT_DEFINITIONS.keys())
+# Stock workflows: canonical name -> ordered list of agent type names.
+# The order determines the default agent of a new conversation (the first
+# agent in the list) and the display order of the workflow's agents.
+# "Coding" is the primary/default stock workflow.
+STOCK_WORKFLOWS: Dict[str, List[str]] = {
+    "Coding": ["coder", "consultant", "developer", "engineer", "researcher"],
+    "Web Research": ["hound", "scribe"],
+}
+
+# The primary stock workflow (used as the fallback when a workspace has no
+# default workflow set).
+STOCK_WORKFLOW_NAME = "Coding"
+
+# Back-compat alias: the agent list of the primary stock workflow.
+STOCK_WORKFLOW_AGENTS = list(STOCK_WORKFLOWS[STOCK_WORKFLOW_NAME])
+
+# Legacy name of the primary stock workflow.  Workflows persisted before the
+# rename (a conversation's ".config.json" "workflow_name", a workspace's
+# "default_workflow", and the override file "dev_workflow.json") still use it.
+LEGACY_STOCK_WORKFLOW_NAME = "Dev Workflow"
+LEGACY_STOCK_WORKFLOW_FILENAME = _config_filename(LEGACY_STOCK_WORKFLOW_NAME)
+
+# Runtime name aliases: legacy name -> canonical name.
+LEGACY_WORKFLOW_ALIASES: Dict[str, str] = {
+    LEGACY_STOCK_WORKFLOW_NAME: STOCK_WORKFLOW_NAME,
+}
+
+
+def canonical_workflow_name(name: str) -> str:
+    """Map a legacy workflow name to its current canonical name."""
+    return LEGACY_WORKFLOW_ALIASES.get(name, name)
+
+
+def _reserved_workflow_filenames() -> set:
+    """Config filenames owned by the stock workflows (incl. the legacy file).
+
+    These files must never be loaded as (or overwritten by) user workflows.
+    """
+    reserved = {_config_filename(n) for n in STOCK_WORKFLOWS}
+    reserved.add(LEGACY_STOCK_WORKFLOW_FILENAME)
+    return reserved
+
+
+class LegacyWorkflowConflictError(Exception):
+    """Both the legacy and the current primary stock-workflow config files exist.
+
+    Raised by :func:`migrate_legacy_stock_workflow`.  The GUI surfaces it in a
+    pre-main-frame dialog and exits.
+    """
+
+    def __init__(self, legacy_path: Path, current_path: Path):
+        self.legacy_path = legacy_path
+        self.current_path = current_path
+        super().__init__(
+            f"Both '{legacy_path}' and '{current_path}' exist.  Compare the two "
+            f"files, set '{current_path}' the way you want it, then delete "
+            f"'{legacy_path}'."
+        )
+
+
+def migrate_legacy_stock_workflow(workflows_dir: Path) -> Optional[Path]:
+    """Rename the legacy primary stock-workflow override file to its new name.
+
+    Renames ``dev_workflow.json`` -> ``coding.json``, but only when
+    ``coding.json`` does not already exist.  If both exist the ambiguity must
+    be resolved by hand, so :class:`LegacyWorkflowConflictError` is raised
+    instead.
+
+    Safe to call on every startup: it is a no-op once migrated.
+
+    Returns:
+        The new config path if a rename happened, otherwise ``None``.
+
+    Raises:
+        LegacyWorkflowConflictError: If both files exist.
+    """
+    legacy_path = workflows_dir / LEGACY_STOCK_WORKFLOW_FILENAME
+    current_path = workflows_dir / _config_filename(STOCK_WORKFLOW_NAME)
+    if not legacy_path.exists():
+        return None
+    if current_path.exists():
+        raise LegacyWorkflowConflictError(legacy_path, current_path)
+    legacy_path.rename(current_path)
+    return current_path
 
 # Ordered tool groups for the agent editing UI (group title, tool names).
 # Order: read-only, file editing, execution, web.
@@ -166,39 +248,43 @@ class WorkflowConfigManager:
                     config_path=config_file,
                 )
 
-        # Load stock workflow (Dev Workflow)
-        stock_wf_path = self.workflows_dir / _config_filename(STOCK_WORKFLOW_NAME)
-        if stock_wf_path.exists():
-            with open(stock_wf_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            # For the stock workflow, the available agents are always the
-            # current stock agents from fs_agents.  The persisted "agents" list
-            # is only a record of which agents have user overrides/configs to
-            # load from the agents directory; it must not determine what stock
-            # agents appear in the workflow or in the GUI dropdown.
-            raw_events = data.get("events", {"work_completion_summary": []})
-            events = {k: _parse_event_groups(v) for k, v in raw_events.items()}
-            self._workflows[STOCK_WORKFLOW_NAME] = WorkflowConfig(
-                name=data.get("name", STOCK_WORKFLOW_NAME),
-                agents=list(STOCK_WORKFLOW_AGENTS),
-                events=events,
-                is_stock=True,
-                config_path=stock_wf_path,
-            )
-        else:
-            self._workflows[STOCK_WORKFLOW_NAME] = WorkflowConfig(
-                name=STOCK_WORKFLOW_NAME,
-                agents=list(STOCK_WORKFLOW_AGENTS),
-                events={"work_completion_summary": []},
-                is_stock=True,
-                config_path=None,
-            )
+        # Load stock workflows (Coding, Web Research, ...).  For a stock
+        # workflow the available agents are always the current stock agents
+        # from fs_agents; the persisted "agents" list is only a record of
+        # which agents have user overrides/configs to load from the agents
+        # directory.  It must not determine what stock agents appear in the
+        # workflow or in the GUI dropdown.
+        for stock_name, stock_agent_list in STOCK_WORKFLOWS.items():
+            stock_wf_path = self.workflows_dir / _config_filename(stock_name)
+            if stock_wf_path.exists():
+                with open(stock_wf_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                raw_events = data.get("events", {"work_completion_summary": []})
+                events = {k: _parse_event_groups(v) for k, v in raw_events.items()}
+                self._workflows[stock_name] = WorkflowConfig(
+                    name=stock_name,
+                    agents=list(stock_agent_list),
+                    events=events,
+                    is_stock=True,
+                    config_path=stock_wf_path,
+                )
+            else:
+                self._workflows[stock_name] = WorkflowConfig(
+                    name=stock_name,
+                    agents=list(stock_agent_list),
+                    events={"work_completion_summary": []},
+                    is_stock=True,
+                    config_path=None,
+                )
 
-        # Load user workflows
+        # Load user workflows.  Config filenames owned by the stock workflows
+        # (and the legacy primary stock-workflow file) must never load as user
+        # workflows.
+        reserved_filenames = _reserved_workflow_filenames()
         for config_file in self.workflows_dir.iterdir():
             if not config_file.is_file() or not config_file.suffix == '.json':
                 continue
-            if config_file.name == _config_filename(STOCK_WORKFLOW_NAME):
+            if config_file.name in reserved_filenames:
                 continue
             with open(config_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
@@ -242,19 +328,19 @@ class WorkflowConfigManager:
         return stock + user
 
     def get_workflow(self, name: str) -> Optional[WorkflowConfig]:
-        """Get a workflow by name."""
-        return self._workflows.get(name)
+        """Get a workflow by name (legacy names are canonicalised)."""
+        return self._workflows.get(canonical_workflow_name(name))
 
     def get_workflow_agent_names(self, workflow_name: str) -> List[str]:
         """Get the list of agent names for a specific workflow."""
-        workflow = self._workflows.get(workflow_name)
+        workflow = self._workflows.get(canonical_workflow_name(workflow_name))
         if workflow:
             return list(workflow.agents)
         return list(STOCK_WORKFLOW_AGENTS)
 
     def get_workflow_agent_config_paths(self, workflow_name: str) -> List[Path]:
         """Get config file paths for all custom/overridden agents in a workflow."""
-        workflow = self._workflows.get(workflow_name)
+        workflow = self._workflows.get(canonical_workflow_name(workflow_name))
         if workflow is None:
             return []
         paths = []
@@ -276,13 +362,19 @@ class WorkflowConfigManager:
         return list(self.get_workflow_agent_config_paths(workflow_name))
 
     def is_stock_workflow(self, name: str) -> bool:
-        """Check if a workflow is the stock Dev Workflow."""
-        return name == STOCK_WORKFLOW_NAME
+        """Check if a workflow is one of the stock workflows."""
+        return canonical_workflow_name(name) in STOCK_WORKFLOWS
 
     def create_workflow(self, name: str) -> WorkflowConfig:
         """Create a new user workflow with no agents."""
         if name in self._workflows:
             raise ValueError(f"Workflow '{name}' already exists")
+        if _config_filename(name) in _reserved_workflow_filenames():
+            raise ValueError(
+                f"Workflow name '{name}' is reserved: its config file name "
+                f"('{_config_filename(name)}') collides with a stock workflow "
+                f"config file."
+            )
         config_path = self.workflows_dir / _config_filename(name)
         data = {"name": name, "agents": [], "events": {"work_completion_summary": []}}
         config_path.write_text(json.dumps(data, indent=2), encoding='utf-8')
@@ -305,19 +397,27 @@ class WorkflowConfigManager:
         del self._workflows[name]
         return True
 
-    def restore_stock_workflow(self) -> WorkflowConfig:
-        """Restore the stock Dev Workflow to its default agent list."""
-        workflow = self._workflows.get(STOCK_WORKFLOW_NAME)
+    def restore_stock_workflow(self, name: str = STOCK_WORKFLOW_NAME) -> WorkflowConfig:
+        """Restore a stock workflow to its default agent list."""
+        name = canonical_workflow_name(name)
+        if name not in STOCK_WORKFLOWS:
+            raise ValueError(f"'{name}' is not a stock workflow")
+        workflow = self._workflows.get(name)
         if workflow and workflow.config_path and workflow.config_path.exists():
             workflow.config_path.unlink()
-        self._workflows[STOCK_WORKFLOW_NAME] = WorkflowConfig(
-            name=STOCK_WORKFLOW_NAME,
-            agents=list(STOCK_WORKFLOW_AGENTS),
+        # Defensive: also remove a lingering legacy primary-workflow file.
+        if name == STOCK_WORKFLOW_NAME:
+            legacy_path = self.workflows_dir / LEGACY_STOCK_WORKFLOW_FILENAME
+            if legacy_path.exists():
+                legacy_path.unlink()
+        self._workflows[name] = WorkflowConfig(
+            name=name,
+            agents=list(STOCK_WORKFLOWS[name]),
             events={"work_completion_summary": []},
             is_stock=True,
             config_path=None,
         )
-        return self._workflows[STOCK_WORKFLOW_NAME]
+        return self._workflows[name]
 
     def add_agent_to_workflow(self, workflow_name: str, agent_name: str) -> bool:
         """Add an agent to a workflow's agent list."""

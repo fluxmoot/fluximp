@@ -1,4 +1,4 @@
-"""Immutable fork/turn state for the Fluximp user agent.
+"""Immutable fork/turn state for the FluxImp user agent.
 
 This module owns all fork/turn calculations and derived state. It is
 dependency-free: no wx, no LangGraph, no LangChain, and no GUI view-model

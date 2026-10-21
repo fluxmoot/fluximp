@@ -74,6 +74,11 @@ class HistoryItem:
     measured_at_width: int = 0
     exact: bool = False
     force_collapsed: bool = False  # collapse_content() freed HWNDs on this card
+    # View > API Request Card toggle (off): the card is hidden from the
+    # history — the view renders a zero-height row and never materializes a
+    # widget.  The model keeps every card (routing still targets it), and
+    # _recompute_suppression() owns the flag.
+    suppressed: bool = False
 
     # Display/derived fields
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -111,11 +116,11 @@ class WorkflowHistoryController:
     """Routes conversation events into the history item model and view."""
 
     MIN_CARD_WIDTH = 520
-    # §8.2: 25px left indent for conditional-agent / system-agent cards.
-    # The view applies the policy (indented widgets are sized
-    # card_w - INDENT_OFFSET, the indent is the sizer-row border); the
-    # controller keeps the constant as the §8.2 policy document.
-    INDENT_OFFSET = 25
+    # §8.2 card indents.  The view applies the policy (a card widget is
+    # sized card_w - indent and the indent is the sizer-row border); the
+    # controller keeps the constants as the §8.2 policy document.
+    PRIMARY_INDENT_OFFSET = 20
+    AGENT_INDENT_OFFSET = 40
     BOTTOM_TOLERANCE_PX = 24
     PADDING = 3
     MEASURE_CHUNK = 50
@@ -151,6 +156,10 @@ class WorkflowHistoryController:
         self._flush_pending = False
         self.load_in_progress = False
         self.non_resumable = False
+        # View > API Request Card toggle (app-wide, pushed by the main frame):
+        # True renders every request card; False keeps only the recent ones
+        # (see set_api_cards_visible / _recompute_suppression).
+        self._api_cards_visible = True
         # §7.1 step-0 sequence-state glob results, held for §7.4 step 8 keyed
         # by each state's own state.event_key (§7.7).
         self._loaded_sequence_states: Dict[str, object] = {}
@@ -264,6 +273,11 @@ class WorkflowHistoryController:
 
     def _materialize(self, item: HistoryItem):
         if self._view is None:
+            return None
+        if item.suppressed:
+            # View > API Request Card toggle (off): a suppressed card has no
+            # widget — routing mutations still land on the model and replay
+            # when the card is shown again.
             return None
         # §8.5 windowed reload: while a backlog streams, defer widget builds
         # to the flush's load-window apply (apply_load_window -> materialize
@@ -1158,6 +1172,10 @@ class WorkflowHistoryController:
                 return
             if self._fork_preview:
                 return
+            # View > API Request Card toggle: refresh the suppression flags
+            # before the range/layout passes so the estimate model, spacers
+            # and scrollbar range all agree with the visible card set.
+            self._recompute_suppression()
             # Capture pre-change scroll geometry for the §8.1 policy.
             state = self._view.capture_scroll_state()
             # §8.5: reconcile the padded visible range, re-measure the
@@ -1729,17 +1747,18 @@ class WorkflowHistoryController:
 
     def _row_border_v(self, item: HistoryItem) -> int:
         """F-A4 (§8.2): one history row's vertical sizer-border
-        contribution — primary cards carry 2px TOP + 2px BOTTOM, panels
-        and error panels 2px wx.ALL (4px vertical either way), and
-        indented cards are LEFT-only (0px vertical). The estimate model
-        counts ROW totals (widget height + this border) so the sizer min
-        height — and with it the scrollbar range — is identical whether
-        a row is a widget or a spacer: the range can no longer churn
-        beneath a held thumb drag as the materialized band swaps
-        (defect A2's structural driver).
+        contribution — panels and error panels carry 2px wx.ALL (4px
+        vertical), while card rows are LEFT-only (0px vertical: a card's
+        sizer border is the row's left indent — PRIMARY_INDENT_OFFSET /
+        AGENT_INDENT_OFFSET). The estimate model counts ROW totals
+        (widget height + this border) so the sizer min height — and with
+        it the scrollbar range — is identical whether a row is a widget
+        or a spacer: the range can no longer churn beneath a held thumb
+        drag as the materialized band swaps (defect A2's structural
+        driver).
         """
         if item is not None and item.item_id.kind == 'card':
-            return 0 if (item.is_conditional or item.is_system_agent) else 4
+            return 0
         return 4
 
     def _estimate_for_item(self, item: HistoryItem, width: int) -> int:
@@ -1750,6 +1769,12 @@ class WorkflowHistoryController:
         item tops (``last_y``) and anchor positions all live in the same
         border-inclusive space the real layout uses.
         """
+        if item.suppressed:
+            # View > API Request Card toggle (off): a suppressed card's row
+            # collapses to zero height so the estimate model, the scrollbar
+            # range, last_y and anchor geometry all agree with the view's
+            # zero-height spacer.
+            return 0
         border = self._row_border_v(item)
         if item.measured_at_width == width and item.exact:
             return item.last_height + border
@@ -1775,6 +1800,84 @@ class WorkflowHistoryController:
         """Public ROW-TOTAL estimate used by the view for spacers — the
         widget height plus the row's vertical border (F-A4)."""
         return self._estimate_for_item(item, self.effective_card_width())
+
+    # ------------------------------------------------------------------
+    # API Request Card visibility (View > API Request Card toggle)
+    # ------------------------------------------------------------------
+
+    def set_api_cards_visible(self, visible: bool):
+        """Show every API Request card (True) or only the recent ones (False).
+
+        Backs the View > API Request Card menu toggle.  With the cards hidden
+        the history keeps only the last completed request card after the last
+        You/Assistant panel plus the still-pending card(s), so the reader sees
+        what is happening now without the full backlog of cards (see
+        _recompute_suppression).  The main frame calls this immediately on the
+        active tab and on a background tab when it becomes active.
+        """
+        visible = bool(visible)
+        if visible == self._api_cards_visible:
+            return
+        self._api_cards_visible = visible
+        self._recompute_suppression()
+        self._schedule_flush()
+
+    def _recompute_suppression(self):
+        """Flag the API Request cards the history should hide.
+
+        With the cards visible nothing is suppressed.  With them hidden a card
+        is kept only when it is the most recent completed card after the last
+        You or Assistant panel, or a still-pending card after it; every other
+        card is suppressed (a zero-height row).  The anchor is the last panel
+        the reader sees — a You panel, or the Assistant panel that closes the
+        turn — so once the Assistant response lands the turn's request cards
+        collapse away, while the conditional-agent cards that follow the
+        Assistant response stay visible under the same rules.  This yields the
+        alternating You / Assistant panels plus at most one completed request
+        card and the live pending card(s):
+
+            You, A(pending)            -> A
+            You, A                     -> A
+            You, A, B(pending)         -> A, B
+            You, B, C(pending)         -> B, C
+            You, A, Assistant          -> (none)
+            You, Assistant, C(pending) -> C
+
+        The flag is advisory to the view (a suppressed card is dematerialized
+        and its row collapses to zero height); the model keeps every card so
+        late routing (tool results, permissions) still finds its target.
+        """
+        if self._api_cards_visible:
+            for item in self._items:
+                item.suppressed = False
+            return
+
+        # Cards at or before the last You / Assistant panel belong to an
+        # earlier turn and are always hidden; the cards after it (the current
+        # turn's requests, plus any conditional-agent cards that follow the
+        # Assistant response) follow the keep rules below.
+        anchor = -1
+        for i, item in enumerate(self._items):
+            if (item.item_id.kind == 'panel'
+                    and item.message is not None
+                    and item.message.role in ('user', 'assistant')):
+                anchor = i
+        # Keep every still-pending card after the anchor and the most recent
+        # completed card after it.
+        keep = set()
+        last_completed = -1
+        for i in range(anchor + 1, len(self._items)):
+            item = self._items[i]
+            if item.item_id.kind != 'card':
+                continue
+            if item.pending:
+                keep.add(i)
+            else:
+                last_completed = i
+        if last_completed >= 0:
+            keep.add(last_completed)
+        for i, item in enumerate(self._items):
+            item.suppressed = (item.item_id.kind == 'card' and i not in keep)
 
     def invalidate_cache_for_width(self, new_width: int):
         """Mark every row measured at a different width as non-exact (§8.5)."""
@@ -1895,7 +1998,8 @@ class WorkflowHistoryController:
         end = min(len(items), start + self.MEASURE_CHUNK)
         if start < end:
             try:
-                self._view.measure_slice(items[start:end])
+                self._view.measure_slice(
+                    [it for it in items[start:end] if not it.suppressed])
             except WX_FAILURES:
                 self._logger.exception(
                     "chunked remeasure slice failed (index %d)", start)
@@ -1960,7 +2064,8 @@ class WorkflowHistoryController:
         end = min(len(items), start + self.MEASURE_CHUNK)
         if start < end:
             try:
-                self._view.measure_slice(items[start:end])
+                self._view.measure_slice(
+                    [it for it in items[start:end] if not it.suppressed])
             except WX_FAILURES:
                 self._logger.exception(
                     "measure-all slice failed (index %d)", start)

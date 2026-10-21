@@ -23,6 +23,12 @@ reasoning_only = CuratedModel(frozenset(("reasoning",)))
 both_fields = CuratedModel(frozenset(("reasoning", "reasoning_content")))
 
 curated_model_by_model_name_by_provider_name = {
+    model_config.SyntheticNewProvider.name: {
+        "hf:deepseek-ai/DeepSeek-V4.1-Flash": reasoning_content_only,
+        "hf:zai-org/GLM-5.3-Flash": reasoning_content_only,
+        "hf:Qwen/Qwen3.8-27B": reasoning_content_only,
+        "hf:moonshotai/Kimi-K3": reasoning_content_only,
+    },
     model_config.SiliconflowComProvider.name: {
         "deepseek-ai/DeepSeek-V4-Flash-0731": reasoning_content_only,
     },
@@ -34,6 +40,7 @@ curated_model_by_model_name_by_provider_name = {
         "deepseek-ai/DeepSeek-V4.1-Flash": reasoning_only,
     },
     model_config.DeepinfraComProvider.name: {
+        "deepseek-ai/DeepSeek-V4.1-Flash-1017": reasoning_content_only,
         "deepseek-ai/DeepSeek-V4.1-Flash": reasoning_content_only,
         "deepseek-ai/DeepSeek-V4-Pro-0813": reasoning_content_only,
         "deepseek-ai/DeepSeek-V4-Flash-0731": reasoning_content_only,
@@ -42,6 +49,7 @@ curated_model_by_model_name_by_provider_name = {
     model_config.TogetherAIProvider.name: {
         "zai-org/GLM-5.3": reasoning_content_only,
         "zai-org/GLM-5.3-Flash": reasoning_content_only,
+        "deepseek-ai/DeepSeek-V4.1-Flash-1017": reasoning_content_only,
         "deepseek-ai/DeepSeek-V4.1-Flash": reasoning_content_only,
         "MiniMaxAI/MiniMax-M3": reasoning_content_only,
         "moonshotai/Kimi-K3": reasoning_content_only,

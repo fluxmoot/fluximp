@@ -302,35 +302,35 @@ def linkup_fetch_tool(url, render_js=True, include_raw_html=False,
         state_updates=result.get("file_view_update", {})
     )
 
+if False:
+    def parallel_search_tool(search_queries, objective=None, mode=None,
+                            max_chars_total=None, session_id=None, **kwargs) -> ToolResult:
+        """Search using Parallel declarative semantic search. Provide keyword search_queries
+        plus optional natural-language objective. Returns token-dense excerpts.
+        Raw JSON response saved to file and added to file view windows."""
+        parallel_search_service = kwargs["parallel_search_service"]
+        try:
+            result = parallel_search_service.search(search_queries=search_queries, objective=objective,
+                mode=mode, max_chars_total=max_chars_total, session_id=session_id)
+        except Exception as e:
+            return ToolResult(success=False, content=f"Error: {str(e)}")
+        return ToolResult(success=True, content=result["summary"], state_updates=result.get("file_view_update", {}))
 
-def parallel_search_tool(search_queries, objective=None, mode=None,
-                         max_chars_total=None, session_id=None, **kwargs) -> ToolResult:
-    """Search using Parallel declarative semantic search. Provide keyword search_queries
-    plus optional natural-language objective. Returns token-dense excerpts.
-    Raw JSON response saved to file and added to file view windows."""
-    parallel_search_service = kwargs["parallel_search_service"]
-    try:
-        result = parallel_search_service.search(search_queries=search_queries, objective=objective,
-            mode=mode, max_chars_total=max_chars_total, session_id=session_id)
-    except Exception as e:
-        return ToolResult(success=False, content=f"Error: {str(e)}")
-    return ToolResult(success=True, content=result["summary"], state_updates=result.get("file_view_update", {}))
 
-
-def parallel_extract_tool(urls, objective=None, search_queries=None,
-                          full_content=False, max_chars_total=None,
-                          session_id=None, **kwargs) -> ToolResult:
-    """Extract content from URLs using Parallel objective-driven extraction.
-    By default returns ranked excerpts; set full_content=True for full page markdown.
-    Up to 20 URLs per request. Raw JSON response saved to file."""
-    parallel_search_service = kwargs["parallel_search_service"]
-    try:
-        result = parallel_search_service.extract(urls=urls, objective=objective,
-            search_queries=search_queries, full_content=full_content,
-            max_chars_total=max_chars_total, session_id=session_id)
-    except Exception as e:
-        return ToolResult(success=False, content=f"Error: {str(e)}")
-    return ToolResult(success=True, content=result["summary"], state_updates=result.get("file_view_update", {}))
+    def parallel_extract_tool(urls, objective=None, search_queries=None,
+                            full_content=False, max_chars_total=None,
+                            session_id=None, **kwargs) -> ToolResult:
+        """Extract content from URLs using Parallel objective-driven extraction.
+        By default returns ranked excerpts; set full_content=True for full page markdown.
+        Up to 20 URLs per request. Raw JSON response saved to file."""
+        parallel_search_service = kwargs["parallel_search_service"]
+        try:
+            result = parallel_search_service.extract(urls=urls, objective=objective,
+                search_queries=search_queries, full_content=full_content,
+                max_chars_total=max_chars_total, session_id=session_id)
+        except Exception as e:
+            return ToolResult(success=False, content=f"Error: {str(e)}")
+        return ToolResult(success=True, content=result["summary"], state_updates=result.get("file_view_update", {}))
 
 
 
@@ -354,3 +354,77 @@ def perplexity_search_tool(query, search_mode=None, search_type=None,
     except Exception as e:
         return ToolResult(success=False, content=f"Error: {str(e)}")
     return ToolResult(success=True, content=result["summary"], state_updates=result.get("file_view_update", {}))
+
+
+def firecrawl_search_tool(query: str, sources=None, categories=None,
+                          limit: int = 5, tbs: str = None, location: str = None,
+                          ignore_invalid_urls: bool = None,
+                          timeout: int = None, **kwargs) -> ToolResult:
+    """Search the web using Firecrawl's search API.
+
+    Returns web, news, and image results from Firecrawl's index. Use
+    'site:example.com' in the query to limit results to a domain. Results are
+    saved to .fluximp/web/search/<workflow_id>/firecrawl_search/.
+
+    Use sources=['web', 'news'] to search multiple sources in one call.
+    Use categories=['research'] for academic results or ['pdf'] for PDFs.
+    Raw JSON response is saved to a file and added to your file view windows.
+    """
+    firecrawl_search_service = kwargs["firecrawl_search_service"]
+
+    try:
+        result = firecrawl_search_service.search(
+            query=query,
+            sources=sources,
+            categories=categories,
+            limit=limit,
+            tbs=tbs,
+            location=location,
+            ignore_invalid_urls=ignore_invalid_urls,
+            timeout=timeout,
+        )
+    except Exception as e:
+        return ToolResult(success=False, content=f"Error: {str(e)}")
+
+    return ToolResult(
+        success=True,
+        content=result["summary"],
+        state_updates=result.get("file_view_update", {})
+    )
+
+
+def firecrawl_scrape_tool(url, formats=None, only_main_content=None,
+                          wait_for: int = None, max_age: int = None,
+                          proxy: str = None, timeout: int = None,
+                          **kwargs) -> ToolResult:
+    """Scrape a single URL using Firecrawl's scrape API.
+
+    Returns clean markdown (default) plus any other requested formats.
+    Handles JavaScript-rendered pages, PDFs, and anti-bot protection
+    server-side. Accepts a single URL (not a list). Results are saved to
+    .fluximp/web/page/<domain>/<workflow_id>/firecrawl_scrape/.
+
+    Use formats=['markdown', 'links'] to also get page links.
+    Use only_main_content=true to strip nav and footer boilerplate.
+    Raw JSON response is saved to a file and added to your file view windows.
+    """
+    firecrawl_search_service = kwargs["firecrawl_search_service"]
+
+    try:
+        result = firecrawl_search_service.scrape(
+            url=url,
+            formats=formats,
+            only_main_content=only_main_content,
+            wait_for=wait_for,
+            max_age=max_age,
+            proxy=proxy,
+            timeout=timeout,
+        )
+    except Exception as e:
+        return ToolResult(success=False, content=f"Error: {str(e)}")
+
+    return ToolResult(
+        success=True,
+        content=result["summary"],
+        state_updates=result.get("file_view_update", {})
+    )

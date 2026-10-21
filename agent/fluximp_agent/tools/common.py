@@ -171,19 +171,15 @@ def create_aggregate_diff(
     for op in file_operations[:operation_position + 1] if operation_position >= 0 else []:
         assert op.operation_type not in ["undo", "redo"]
         filepath = op.file_path
-        if filepath is None:
-            assert op.operation_type == 'apply_patch'
-            # TODO applied patches can affect multiple files
-        else:
-            is_deleted = op.operation_type == "delete_file"
+        is_deleted = op.operation_type == "delete_file"
 
-            if filepath not in file_states:
-                # First time seeing this file
-                file_states[filepath] = (op.compressed_before, op.compressed_after, is_deleted)
-            else:
-                # Update existing file tracking
-                original, _, _ = file_states[filepath]
-                file_states[filepath] = (original, op.compressed_after, is_deleted)
+        if filepath not in file_states:
+            # First time seeing this file
+            file_states[filepath] = (op.compressed_before, op.compressed_after, is_deleted)
+        else:
+            # Update existing file tracking
+            original, _, _ = file_states[filepath]
+            file_states[filepath] = (original, op.compressed_after, is_deleted)
 
     # Generate consolidated diff for each modified file
     diff_parts = []

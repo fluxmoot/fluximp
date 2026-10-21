@@ -2,6 +2,8 @@
 
 Provides utilities for omitting content/validation arg values from tool call
 messages sent back to the agent, keeping the agent's context window lean.
+Arg-value omission is optional (see the omit_arg_values parameter); the same
+transforms also drop whole skipped/rejected calls from the message.
 Also provides think-block stripping and position-mapping helpers used by
 the omission transforms.
 """
@@ -225,7 +227,7 @@ def compute_omitted_args(tool_name: str, registry, original_values: dict = None)
 
 # ââ Standalone omission transformer functions ââ
 
-def compute_api_omission_transformer(last_message, valid_calls, messages, registry, keep_first_n_calls=None):
+def compute_api_omission_transformer(last_message, valid_calls, messages, registry, keep_first_n_calls=None, omit_arg_values=True):
     """Compute omission transformer for API protocol tool calls.
     
     Creates a copy of the last AIMessage with content/validation tagged
@@ -236,12 +238,15 @@ def compute_api_omission_transformer(last_message, valid_calls, messages, regist
             retain the first N tool calls from the original message. This is
             used when additional parsed calls were skipped due to the per-
             response execution limit.
+        omit_arg_values: When False, arg values are left intact and only the
+            call-dropping (keep_first_n_calls) behavior is applied.
     """
     api_tc_dict_edits = []
-    for i, (tool_name, args) in enumerate(valid_calls):
-        omitted = compute_omitted_args(tool_name, registry, args)
-        if omitted:
-            api_tc_dict_edits.append((i, omitted))
+    if omit_arg_values:
+        for i, (tool_name, args) in enumerate(valid_calls):
+            omitted = compute_omitted_args(tool_name, registry, args)
+            if omitted:
+                api_tc_dict_edits.append((i, omitted))
     
     if api_tc_dict_edits or keep_first_n_calls is not None:
         omission_msg = last_message.model_copy(deep=True)
@@ -259,7 +264,8 @@ def compute_api_omission_transformer(last_message, valid_calls, messages, regist
 
 def compute_text_omission_transformer(last_message, tc_dict_edits, tc_name_edits,
                                        content_edits, reasoning_edits, content_was_stripped,
-                                       messages, keep_first_n_calls=None, call_span_deletions=None):
+                                       messages, keep_first_n_calls=None, call_span_deletions=None,
+                                       omit_arg_values=True):
     """Compute omission transformer for text protocol tool calls.
     
     Creates a copy of the last AIMessage with content/validation tagged
@@ -272,7 +278,14 @@ def compute_text_omission_transformer(last_message, tc_dict_edits, tc_name_edits
             "reasoning") to a list of (start, end) spans of whole calls that
             should be removed entirely. Whole-call deletion is applied before
             arg-value omission so that skipped calls disappear from history.
+        omit_arg_values: When False, the arg-value edits are dropped and only
+            whole-call deletion / keep_first_n_calls is applied.
     """
+    if not omit_arg_values:
+        tc_dict_edits = []
+        tc_name_edits = []
+        content_edits = []
+        reasoning_edits = []
     has_edits = bool(tc_dict_edits or tc_name_edits or content_edits or reasoning_edits)
     has_deletions = bool(call_span_deletions and any(call_span_deletions.values()))
     if not has_edits and not has_deletions and keep_first_n_calls is None:

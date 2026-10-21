@@ -89,13 +89,13 @@ class SyntheticNewProvider(ModelProvider):
         return sorted(_models)
 
     def get_default_model(self) -> str:
-        default_model = "hf:zai-org/GLM-5.2"
+        default_model = "hf:deepseek-ai/DeepSeek-V4.1-Flash"
         assert default_model in self.get_model_names()
         return default_model
 
     def verify_model_response(self, requested_model: str, actual_model: str) -> None:        
         # synthetic.new requires the 'hf:' prefix in the request, but doesn't include in the reponse
-        assert actual_model == requested_model[3:] or (requested_model == "hf:moonshotai/Kimi-K2.5" and actual_model == "nvidia/Kimi-K2.5-NVFP4") or (requested_model == "hf:zai-org/GLM-4.7" and actual_model == "accounts/fireworks/models/glm-4p7") or (requested_model == "hf:deepseek-ai/DeepSeek-V3.2" and actual_model == "accounts/fireworks/models/deepseek-v3p2") or (requested_model == "hf:nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4" and actual_model == "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8"), f"Model mismatch: requested {requested_model}, got {actual_model}"
+        assert (actual_model == requested_model[3:]) or (requested_model == "hf:nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4" and actual_model == "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8"), f"Model mismatch: requested {requested_model}, got {actual_model}"
 
 
 class ChutesAIProvider(ModelProvider):
@@ -1407,6 +1407,8 @@ class SiliconflowComProvider(ModelProvider):
             "Qwen/Qwen3.5-397B-A17B",
             "Qwen/Qwen3.6-27B",
             "Qwen/Qwen3.6-35B-A3B",
+            "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+            "deepseek-ai/DeepSeek-V4.1-Flash",
             "deepseek-ai/DeepSeek-V4-Pro-0813",
             "deepseek-ai/DeepSeek-V4-Flash-0731",
             # These are the preview versions of the ones above
@@ -1678,6 +1680,7 @@ class DeepinfraComProvider(ModelProvider):
 
     def get_model_names(self) -> list[str]:
         _models = [
+            "deepseek-ai/DeepSeek-V4.1-Flash-1017",
             "deepseek-ai/DeepSeek-V4.1-Flash",
             "deepseek-ai/DeepSeek-V4-Pro-0813",
             "deepseek-ai/DeepSeek-V4-Flash-0731",
@@ -1700,16 +1703,14 @@ class DeepinfraComProvider(ModelProvider):
         return sorted(_models)
 
     def get_default_model(self) -> str:
-        # Try this on the tests next
-        # default_model = "Qwen/Qwen3.6-35B-A3B"
-        default_model = "deepseek-ai/DeepSeek-V4-Flash-0731"
+        default_model = "deepseek-ai/DeepSeek-V4.1-Flash"
         assert default_model in self.get_model_names()
         return default_model
 
     def get_model_for_difficulty(self, difficulty: int) -> str:
-        # if difficulty >= 1:
-        #     return "zai-org/GLM-4.7"
-        return self.get_default_model()
+        model = "deepseek-ai/DeepSeek-V4-Flash-0731"
+        assert model in self.get_model_names()
+        return model
 
 class TogetherAIProvider(ModelProvider):
     """Provider for together.ai API."""
@@ -1728,6 +1729,7 @@ class TogetherAIProvider(ModelProvider):
             "zai-org/GLM-5.3",
             "zai-org/GLM-5.3-Flash",
             "zai-org/GLM-5.2",
+            "deepseek-ai/DeepSeek-V4.1-Flash-1017",
             "deepseek-ai/DeepSeek-V4.1-Flash",
             "deepseek-ai/DeepSeek-V4-Pro-0813",
             # Deprecated on 10/22/2026
@@ -1738,9 +1740,14 @@ class TogetherAIProvider(ModelProvider):
         return sorted(_models)
 
     def get_default_model(self) -> str:
-        default_model = "zai-org/GLM-5.3-Flash"
+        default_model = "deepseek-ai/DeepSeek-V4.1-Flash"
         assert default_model in self.get_model_names()
         return default_model
+
+    def get_model_for_difficulty(self, difficulty: int) -> str:
+        model = "deepseek-ai/DeepSeek-V4.1-Flash"
+        assert model in self.get_model_names()
+        return model
 
 class AkashmlComProvider(ModelProvider):
     """Provider for akashml.com API."""
@@ -1992,8 +1999,8 @@ def get_default_provider_name():
     #return "inceptron.io"
     #return "fireworks.ai"
     #return "wandb.ai"
-    return "deepinfra.com"
-    #return "together.ai"
+    #return "deepinfra.com"
+    return "together.ai"
     #return "akashml.com"
     #return "featherless.ai"
     #return "friendli.ai"
@@ -2337,10 +2344,13 @@ def get_model_config(provider: ModelProvider = None, model: str = None) -> Model
                     # 8192 no timeouts
                     max_completion_tokens = 8192
                 elif provider.name == SyntheticNewProvider.name:
-                    # 16384 got a 10 minute timeout on the first workflow
-                    # 10000 got a 10 minute timeout on the first workflow it was used in
-                    # 8192 
-                    max_completion_tokens = 8192
+                    if 'flash' in model_lower:
+                        pass
+                    else:
+                        # 16384 got a 10 minute timeout on the first workflow
+                        # 10000 got a 10 minute timeout on the first workflow it was used in
+                        # 8192 
+                        max_completion_tokens = 8192
                 elif provider.name == FireworksAIProvider.name:
                     # 16384 no timeouts
                     pass
@@ -2421,10 +2431,13 @@ def get_model_config(provider: ModelProvider = None, model: str = None) -> Model
                         "include_reasoning": True,
                     }
                 else:
+                    assert "chat_template_kwargs" not in extra_body
                     extra_body["chat_template_kwargs"] = {
                         "clear_thinking": False,
                     }
+                    assert "parse_reasoning" not in extra_body
                     extra_body["parse_reasoning"] = True
+                    assert "include_reasoning" not in extra_body
                     extra_body["include_reasoning"] = True
             elif provider.name == InceptronIOProvider.name:
                 if extra_body is None:
@@ -2437,9 +2450,23 @@ def get_model_config(provider: ModelProvider = None, model: str = None) -> Model
                 else:
                     assert "thinking" not in extra_body
                     extra_body["thinking"] = {"type": "enabled", "clear_thinking": False}
+                    assert "chat_template_kwargs" not in extra_body
                     extra_body["chat_template_kwargs"] = {
                         "clear_thinking": False,
-                    }                       
+                    }
+            elif provider.name == SyntheticNewProvider.name:
+                if extra_body is None:
+                    extra_body = {
+                        "chat_template_kwargs": {
+                            "clear_thinking": False,
+                        },                        
+                    }
+                else:
+                    assert "chat_template_kwargs" not in extra_body
+                    extra_body["chat_template_kwargs"] = {
+                        "clear_thinking": False,
+                    }
+                
             
 
         elif ("kimi-k2.5" in model_lower
@@ -2585,6 +2612,11 @@ def get_model_config(provider: ModelProvider = None, model: str = None) -> Model
                 extra_body = {
                     "reasoning_effort": "high",
                 }
+                if "1017" in model_lower:
+                    # https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017
+                    # temperature is also 1 like the thee above, but the recommended
+                    # top_p changes to 1.0 for 1017
+                    top_p = 1.0
             else:
                 extra_body = {
                     "thinking": {"type": "enabled"},
@@ -2615,7 +2647,12 @@ def get_model_config(provider: ModelProvider = None, model: str = None) -> Model
                 pass
             elif provider.name == DeepinfraComProvider.name:
                 if '4.1' in model_lower:
-                    pass
+                    if '1017' in model_lower:
+                        pass
+                    else:
+                        # 16384 10 minute timeouts one request then 2 consecutive on next request
+                        # 14000
+                        max_completion_tokens = 14000
                 else:
                     #temperature = 0.9
                     temperature = 0.7

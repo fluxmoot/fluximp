@@ -1,8 +1,10 @@
 from typing import Tuple, Optional
 from datetime import datetime, timezone
 
+from fluximp_agent.filesystem_service import check_line_mode_file_size
 from fluximp_agent.tools.tool_definitions import ToolResult
 from fluximp_agent.tools.common import compress, FileOperation
+from fluximp_agent.context_managment_constants import VIEW_BUDGET_DESC
 from fluximp_agent.state_service import normalize_file_path
 
 
@@ -59,6 +61,9 @@ def delete_file_tool(file_path: str, **kwargs) -> ToolResult:
     compressed_before = None
     if path.exists() and path.is_file():
         try:
+            size_error = check_line_mode_file_size(path, file_path)
+            if size_error:
+                return ToolResult(success=False, content=size_error)
             content = path.read_text(encoding='utf-8')
             compressed_before = compress(content)
         except Exception as e:
@@ -99,13 +104,13 @@ def delete_file_tool(file_path: str, **kwargs) -> ToolResult:
         state_updates={**state_update, **file_view_update, **deleted_file_update}
     )
 def write_file_tool(file_path: str, content: str, **kwargs) -> ToolResult:
-    """Write content to a file - STATE-MODIFYING tool.
+    f"""Write content to a file - STATE-MODIFYING tool.
 
     Creates directories if needed.
 
     When the file_view_windows experiment is active, this tool also adds the
     written file to the file view windows (first 2500 lines). File view windows
-    are automatically closed when total size exceeds 128KB.
+    are automatically closed when total size exceeds {VIEW_BUDGET_DESC}.
 
     Args:
         file_path: Target file path
@@ -127,6 +132,9 @@ def write_file_tool(file_path: str, content: str, **kwargs) -> ToolResult:
     compressed_before = None
     if path.exists() and path.is_file():
         try:
+            size_error = check_line_mode_file_size(path, file_path)
+            if size_error:
+                return ToolResult(success=False, content=size_error)
             old_content = path.read_text(encoding='utf-8')
             compressed_before = compress(old_content)
         except Exception as e:

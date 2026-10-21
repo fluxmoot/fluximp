@@ -16,6 +16,11 @@ from typing import List, Optional, Dict, Tuple, Any
 from pathlib import Path
 from copy import deepcopy
 
+from fluximp_agent.filesystem_service import check_line_mode_file_size
+from fluximp_agent.context_managment_constants import (
+    MAX_FILE_VIEW_BYTES as _MAX_FILE_VIEW_BYTES,
+    VIEW_TRUNCATION_MARKER,
+)
 from fluximp_agent.tools.common import FileOperation, create_aggregate_diff
 
 
@@ -112,16 +117,9 @@ class StateService:
     All state modifications must be done via the build_* methods which
     return state update dicts for LangGraph's reducer flow.
     """
-    #MAX_FILE_VIEW_BYTES = 360000
-    MAX_FILE_VIEW_BYTES = 320000
-    #MAX_FILE_VIEW_BYTES = 280000
-    #MAX_FILE_VIEW_BYTES = 240000
-    #MAX_FILE_VIEW_BYTES = 200000
-    #MAX_FILE_VIEW_BYTES = 163840  # 160KB limit for total view content (file views + search/list views)
-    #MAX_FILE_VIEW_BYTES = 120000
-    # Too small both GLM5.1 and Kimi K2.7 Code failed to start editing poc/sdl_vulkan_cuda_lvgl to continue
-    # phase 3 of a plan to refactor from C-sytle to C++20 with RAII.
-    #MAX_FILE_VIEW_BYTES = 163840/2
+    # Single source of truth lives in fluximp_agent.context_managment_constants.
+    # Kept as an alias so existing self.MAX_FILE_VIEW_BYTES references still work.
+    MAX_FILE_VIEW_BYTES = _MAX_FILE_VIEW_BYTES
     
     def __init__(self, state: Optional[Dict[str, Any]] = None, filesystem_service=None):
         """Initialize the state service with a read-only view into state.
@@ -310,7 +308,8 @@ class StateService:
     def build_file_view_windows_update(
         self, 
         requests: List[FileViewRequest], 
-        source: str = "add"
+        source: str = "add",
+        current_windows: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """Build state update for adding file view windows.
         
@@ -319,6 +318,8 @@ class StateService:
         Args:
             requests: List of FileViewRequest to add
             source: Either "add" (from add_file_view tool) or "edit" (from edit_file_lines)
+            current_windows: Optional override for the current windows dict
+                (used when chaining several view updates for one tool call)
             
         Returns:
             State update dict with complete new file_view_windows
@@ -328,7 +329,7 @@ class StateService:
             return {}
         
         # Start with deep copy of current windows
-        current = self.file_view_windows
+        current = current_windows if current_windows is not None else self.file_view_windows
         if current:
             new_windows = deepcopy(current)
         else:
@@ -458,7 +459,8 @@ class StateService:
             view_start = max(1, start_line - 5)
             return self.build_file_view_windows_update(
                 [FileViewRequest(file_path=file_path, offset=view_start, limit=max(old_line_count, new_line_count, 1) + 10)],
-                source=source
+                source=source,
+                current_windows=current_windows
             )
         
         # Extract windows
@@ -574,11 +576,13 @@ class StateService:
         
         return {"file_view_windows": new_windows}
 
-    def build_file_view_windows_removal(self, file_paths: List[str]) -> Dict[str, Any]:
+    def build_file_view_windows_removal(self, file_paths: List[str], current_windows: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Build state update for removing file view windows.
         
         Args:
             file_paths: List of file paths to remove view windows for
+            current_windows: Optional override for the current windows dict
+                (used when chaining several view updates for one tool call)
             
         Returns:
             State update dict with complete new file_view_windows
@@ -587,7 +591,7 @@ class StateService:
             return {}
         
         # Start with deep copy of current windows
-        current = self.file_view_windows
+        current = current_windows if current_windows is not None else self.file_view_windows
         new_windows = deepcopy(current) if current else {}
         
         for file_path in file_paths:
@@ -956,6 +960,13 @@ class StateService:
                 else:
                     assert path.is_file(), f"Path is not a file: {file_path}"
 
+                # Fail fast (loudly) if the file exceeds the line-mode size limit.
+                # We raise rather than silently evict so the failure is noisy and
+                # the run fails with a clear error instead of a confusing context
+                # window exceeded error.
+                size_error = check_line_mode_file_size(path, file_path)
+                if size_error:
+                    raise ValueError(size_error)
                 # Handle non-UTF-8 / binary content defensively so a bad file
                 # never crashes the whole agent run (mirrors filesystem_read.py
                 # and state_service._get_search_results handling).
@@ -967,6 +978,9 @@ class StateService:
                 file_bytes = 0
                 file_windows_content = []
 
+                truncated = False
+                truncation_marker = VIEW_TRUNCATION_MARKER
+                marker_bytes = len(truncation_marker.encode('utf-8'))
                 for window in windows:
                     # Adjust window to actual file bounds
                     start = max(1, window.start_line)
@@ -976,16 +990,37 @@ class StateService:
                         print(f"DEBUG get_all_views start past end {start} > {len(lines)} for {path}")
                         continue
 
-                    # Extract lines with line numbers
-                    selected_lines = lines[start - 1:end]
-                    numbered_content = "\n".join(
-                        f"{i:4d} | {line}"
-                        for i, line in enumerate(selected_lines, start=start)
-                    )
+                    # Render lines with line numbers, stopping at the byte budget so a
+                    # single huge view can never exceed MAX_FILE_VIEW_BYTES.
+                    rendered_lines = []
+                    used_bytes = 0
+                    actual_end = start - 1
+                    for i, line in enumerate(lines[start - 1:end], start=start):
+                        piece = f"{i:4d} | {line}"
+                        piece_bytes = len(piece.encode('utf-8')) + 1  # +1 for joining newline
+                        if file_bytes + used_bytes + piece_bytes + marker_bytes > self.MAX_FILE_VIEW_BYTES:
+                            truncated = True
+                            break
+                        rendered_lines.append(piece)
+                        used_bytes += piece_bytes
+                        actual_end = i
 
-                    window_bytes = len(numbered_content.encode('utf-8'))
-                    file_windows_content.append((start, end, numbered_content))
-                    file_bytes += window_bytes
+                    if not rendered_lines:
+                        # Nothing fits; stop rendering further windows for this file
+                        truncated = True
+                        break
+
+                    numbered_content = "\n".join(rendered_lines)
+                    file_windows_content.append((start, actual_end, numbered_content))
+                    file_bytes += len(numbered_content.encode('utf-8'))
+
+                    if truncated:
+                        break
+
+                if truncated and file_windows_content:
+                    s, e, c = file_windows_content[-1]
+                    file_windows_content[-1] = (s, e, c + truncation_marker)
+                    file_bytes += marker_bytes
 
                 if file_windows_content:
                     # Compute hash of all rendered content for this file
@@ -1047,6 +1082,13 @@ class StateService:
                         query_type, params, filesystem_service
                     )
 
+                    # Bound search view content to MAX_FILE_VIEW_BYTES so a single
+                    # large search/list view cannot blow the context budget.
+                    if search_content is not None and search_bytes > self.MAX_FILE_VIEW_BYTES:
+                        _trunc_marker = VIEW_TRUNCATION_MARKER
+                        _budget = self.MAX_FILE_VIEW_BYTES - len(_trunc_marker.encode('utf-8'))
+                        search_content = search_content.encode('utf-8')[:_budget].decode('utf-8', errors='ignore') + _trunc_marker
+                        search_bytes = len(search_content.encode('utf-8'))
                     if search_content is not None:
                         # Compute hash
                         content_hash = hashlib.md5(search_content.encode('utf-8')).hexdigest()

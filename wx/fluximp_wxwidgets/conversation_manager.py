@@ -1,4 +1,4 @@
-"""GUI-agnostic conversation management for Fluximp agents."""
+"""GUI-agnostic conversation management for FluxImp agents."""
 
 import os
 import sys
@@ -35,6 +35,11 @@ from fluximp_protocol.user_agent.fork_turn_state import (
     ForkTurnStateError,
 )
 
+from fluximp_wxwidgets.workflow_config import (
+    STOCK_WORKFLOW_NAME,
+    canonical_workflow_name,
+)
+
 class ConversationStatus(Enum):
     """Status of a conversation turn."""
     EMPTY = "empty"
@@ -58,6 +63,32 @@ class ForkTurnInfo:
     # Sum of the turn's per-response API durations (the "Time:" value shown
     # on request cards): response end_time minus request start_time.
     time_seconds: float = 0.0
+
+
+@dataclass
+class RequestTokenInfo:
+    """Per-request token counts for one API request within a fork/turn.
+
+    The API chart (right_panel.ForkTokenChart) plots one point per instance,
+    so a turn's several requests stay distinct points where ForkTurnInfo
+    holds only their sums (which is what the fork/turn grid shows).  The four
+    counts carry the same names as ForkTurnInfo's, so an api_chart series key
+    names the attribute on either dataclass.
+    """
+    fork: int
+    turn: int
+    request_seq: int
+    prompt_tokens: int = 0
+    cached_tokens: int = 0
+    completion_tokens: int = 0
+    reasoning_tokens: int = 0
+
+
+# The token counts a response header reports, in ForkTurnInfo's declaration
+# order.  A tuple, so the per-request accumulation in _process_message cannot
+# drift from the per-turn accumulation beside it.
+REQUEST_TOKEN_ATTRS: Tuple[str, ...] = (
+    "prompt_tokens", "cached_tokens", "completion_tokens", "reasoning_tokens")
 
 
 @dataclass
@@ -168,7 +199,7 @@ class Conversation:
         self.start_time = start_time
         self.agent_type = agent_type
         self.agent_configs: List[str] = []  # list of agent config file paths for --agent-config
-        self.workflow_name: str = 'Dev Workflow'  # which workflow this conversation belongs to
+        self.workflow_name: str = STOCK_WORKFLOW_NAME  # which workflow this conversation belongs to
 
         # Create subdirectories
         self.io_dir.mkdir(parents=True, exist_ok=True)
@@ -215,6 +246,15 @@ class Conversation:
         # Track per-request metadata from request and response headers: (fork, turn, request_seq) -> Dict
         # Used to store request-specific metadata
         self._request_metadata: Dict[Tuple[int, int, int], Dict] = {}
+
+        # Per-request token counts from response headers:
+        # (fork, turn, request_seq) -> RequestTokenInfo.  The API chart plots
+        # one point per entry, so a turn's several requests stay distinct
+        # where fork_turns[key] holds only their sums.  A response whose
+        # request never paired (desync, request_seq 0) is kept under seq 0
+        # rather than dropped, so the entries for a turn still sum to that
+        # turn's ForkTurnInfo.
+        self._request_tokens: Dict[Tuple[int, int, int], RequestTokenInfo] = {}
 
         # Track per-turn metadata from request and response headers: (fork, turn) -> Dict
         # Used to combine metadata for model_message_to_user messages (aggregates across all requests in a turn)
@@ -960,6 +1000,22 @@ class Conversation:
                     except (ValueError, TypeError):
                         pass
 
+                # The same four counts, kept per request instead of summed
+                # into the turn, for the API chart's one-point-per-request
+                # line (View > API Chart).  The row is created on the first
+                # count this response reports, so a response that reports
+                # none -- and a request abandoned before it ever answered --
+                # contributes no point rather than a phantom zero.
+                token_row = self._request_tokens.get((fork, turn, request_seq))
+                for attr in REQUEST_TOKEN_ATTRS:
+                    count = getattr(header, attr)
+                    if count is None:
+                        continue
+                    if token_row is None:
+                        token_row = RequestTokenInfo(fork, turn, request_seq)
+                        self._request_tokens[(fork, turn, request_seq)] = token_row
+                    setattr(token_row, attr, getattr(token_row, attr) + count)
+
             # Parse subheader-encoded payload for content and reasoning
             parsed = parse_response_payload(payload) if payload else {}
             content_text = parsed.get("content", "")
@@ -1556,7 +1612,8 @@ class Conversation:
                     config_data = json.load(f)
                 self.agent_type = config_data.get('agent_type', self.agent_type)
                 self.agent_configs = config_data.get('agent_configs', self.agent_configs)
-                self.workflow_name = config_data.get('workflow_name', self.workflow_name)
+                self.workflow_name = canonical_workflow_name(
+                    config_data.get('workflow_name', self.workflow_name))
                 self.current_provider = config_data.get('current_provider', '')
                 self.current_model = config_data.get('current_model', '')
                 self.provider_models = config_data.get('provider_models', {})
@@ -1566,6 +1623,18 @@ class Conversation:
     def get_fork_turns(self) -> List[ForkTurnInfo]:
         """Get all fork/turn information sorted by fork then turn."""
         return sorted(self.fork_turns.values(), key=lambda x: (x.fork, x.turn))
+
+    def get_request_tokens(self) -> List[RequestTokenInfo]:
+        """Per-request token rows for the API chart, in request order.
+
+        One row per API request that reported token usage, ordered by
+        (fork, turn, request_seq) -- the order the grid lists turns in, and
+        within a turn the order the requests were made -- so the chart's X
+        index is the request's ordinal.  A response whose request never
+        paired (seq 0) sorts first within its turn.
+        """
+        return sorted(self._request_tokens.values(),
+                      key=lambda x: (x.fork, x.turn, x.request_seq))
 
     def get_messages_for_turn(self, fork: int, turn: int) -> List[ConversationMessage]:
         """Get all messages for a specific fork/turn."""

@@ -173,8 +173,23 @@ class ParseToolCallsNode(BaseParseToolCallsNode):
                 consecutive_max_reasoning_count=max_reasoning_count),
             "parse_tool_calls(max_reasoning_error)")
 
+    def _arg_value_omission_enabled(self):
+        """Return True when the 'omit_arg_values' experiment is active.
+
+        A registry without an experiments service (e.g. lightweight test
+        registries) is treated as enabled so the historical always-on
+        behavior is preserved.
+        """
+        experiments_service = getattr(self.registry, '_experiments_service', None)
+        if experiments_service is None:
+            return True
+        return experiments_service.is_enabled('omit_arg_values')
+
     def compute_api_omission_transformer(self, last_message, valid_calls, messages, keep_first_n_calls=None):
-        return compute_api_omission_transformer(last_message, valid_calls, messages, self.registry, keep_first_n_calls=keep_first_n_calls)
+        return compute_api_omission_transformer(
+            last_message, valid_calls, messages, self.registry,
+            keep_first_n_calls=keep_first_n_calls,
+            omit_arg_values=self._arg_value_omission_enabled())
     
     def compute_text_omission_transformer(self, last_message, tc_dict_edits, tc_name_edits,
                                           content_edits, reasoning_edits, content_was_stripped,
@@ -183,7 +198,8 @@ class ParseToolCallsNode(BaseParseToolCallsNode):
             last_message, tc_dict_edits, tc_name_edits,
             content_edits, reasoning_edits, content_was_stripped, messages,
             keep_first_n_calls=keep_first_n_calls,
-            call_span_deletions=call_span_deletions)
+            call_span_deletions=call_span_deletions,
+            omit_arg_values=self._arg_value_omission_enabled())
 
 
 class ExecuteToolCallNode(BaseExecuteToolCallNode):

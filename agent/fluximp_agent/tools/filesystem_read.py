@@ -5,7 +5,12 @@ from typing import Optional
 
 import python_ripgrep
 
+from fluximp_agent.filesystem_service import check_line_mode_file_size
 from fluximp_agent.tools.tool_definitions import ToolResult
+from fluximp_agent.context_managment_constants import (
+    MAX_FILE_VIEW_BYTES,
+    VIEW_BUDGET_DESC,
+)
 from fluximp_agent.tools.common import _validate_paths_exist, _validate_paths_within_working_dir
 
 
@@ -144,6 +149,9 @@ def read_file(file_path: str, offset: int = 1, limit: int = 2500, line_numbers: 
         if not path.is_file():
             return ToolResult(success=False, content=f"Error: '{file_path}' is not a file")
 
+        size_error = check_line_mode_file_size(path, file_path)
+        if size_error:
+            return ToolResult(success=False, content=size_error)
         # Read file content
         content = path.read_text(encoding='utf-8')
         lines = content.splitlines()
@@ -175,7 +183,24 @@ def read_file(file_path: str, offset: int = 1, limit: int = 2500, line_numbers: 
         if end_idx < len(lines):
             result_lines.append(f"\n... ({len(lines) - end_idx} more lines)")
 
-        return ToolResult(success=True, content="\n".join(result_lines))
+        # Bound rendered output to the view content byte budget: a file with
+        # very long lines can exceed the context budget even when under the
+        # line-mode size limit, so truncate the rendered text here too.
+        max_bytes = MAX_FILE_VIEW_BYTES
+        output = "\n".join(result_lines)
+        if len(output.encode('utf-8')) > max_bytes:
+            truncated_lines = []
+            used_bytes = 0
+            for line in result_lines:
+                line_bytes = len(line.encode('utf-8')) + 1  # +1 for joining newline
+                if used_bytes + line_bytes > max_bytes:
+                    break
+                truncated_lines.append(line)
+                used_bytes += line_bytes
+            truncated_lines.append(f"... (output truncated: exceeds view content budget of {VIEW_BUDGET_DESC})")
+            output = "\n".join(truncated_lines)
+
+        return ToolResult(success=True, content=output)
 
     except Exception as e:
         return ToolResult(success=False, content=f"Error reading file '{file_path}': {e}")

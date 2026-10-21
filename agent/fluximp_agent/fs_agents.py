@@ -14,7 +14,7 @@ _READONLY_TOOLS = [
     "close_view",
 ]
 
-# File editing tools available to coder and developer agents
+# File editing tools available to coder, developer, and scribe agents
 _FILE_EDIT_TOOLS = [
     "delete_file",
     "write_file",
@@ -29,7 +29,7 @@ _FILE_EDIT_TOOLS = [
     "redo",
 ]
 
-# Web search/extraction tools available to researcher and engineer agents
+# Web search/extraction tools available to researcher, engineer, hound, and scribe agents
 _WEB_TOOLS = [
     "tavily_search",
     "tavily_extract",
@@ -39,9 +39,11 @@ _WEB_TOOLS = [
     "tinyfish_search",
     # "linkup_search",
     # "linkup_fetch",
-    "parallel_search",
-    "parallel_extract",
+    # "parallel_search",
+    # "parallel_extract",
     "perplexity_search",
+    "firecrawl_search",
+    "firecrawl_scrape",
 ]
 
 # Execution tools available only to developer agent
@@ -81,8 +83,8 @@ _RESEARCHER_DESCRIPTION = (
     "anything and you lack the tools to do so.\n\n"
     "This harness provides the following AI "
     "agents beyond yourself:\n"
-    "- coder: AI agent with tools that allow it to search, read, "
     "- consultant: AI agent with read-only tools.\n"
+    "- coder: AI agent with tools that allow it to search, read, "
     "create, and modify files in the workspace.\n"
     "- developer: AI agent with tools that allow it run Python "
     "scripts, as well as to search, read, create, and modify files "
@@ -102,6 +104,51 @@ _CODER_DESCRIPTION = share_modifier + "\n\nWhile you are purposely not provided 
 _DEVELOPER_DESCRIPTION = share_modifier + "\n\nWhile you are purposely not provided with the tools need to search the web and fetch web pages this harness provides the user with another AI agent called 'engineer' that is able to do so."
 
 _ENGINEER_DESCRIPTION = share_modifier
+
+_HOUND_DESCRIPTION = (
+    "You are required to use the provided tools to answer questions "
+    "asked by the user and provide advice to aid the user in "
+    "accomplishing their tasks, projects, goals, etc. either directly "
+    "themselves or by using other AI agents with tools that allow them "
+    "to take actions.  It is not your job to modify files or run "
+    "anything and you lack the tools to do so.\n\n"
+    "When using the send_message tool format your message as markdown "
+    "and include all relevant urls as hyperlinks.  Its fine to have "
+    "some sources / references list at the end, but you should provide "
+    "hyperlinks inline where technically feasible.\n\n"
+    "This harness provides the following AI "
+    "agents beyond yourself:\n"
+    "- scribe: AI agent with read-only, file editing, and web "
+    "search/extraction tools.\n"
+)
+
+_SCRIBE_DESCRIPTION = (
+    "You are required to use the provided tools to answer questions "
+    "asked by the user and provide advice to aid the user in "
+    "accomplishing their tasks, projects, goals, etc. either directly "
+    "themselves or by using other AI agents with tools that allow them "
+    "to take actions.  It is not your job to modify files or run "
+    "anything and you lack the tools to do so.\n\n"
+    "When using the send_message tool format your message as markdown "
+    "and include all relevant urls as hyperlinks.  Its fine to have "
+    "some sources / references list at the end, but you should provide "
+    "hyperlinks inline where technically feasible.\n\n"
+    "Do not directly create or modify files unless the user explicitly "
+    "requests or instructs you to do so.  When creating a new document "
+    "your default should be to give it a .md extension and use markdown "
+    "format for content, but if the user requests a specific format you "
+    "should comply and utilize that format if possible with the tools you "
+    "are provided.  If its not possible for you to work with the requested "
+    "format (e.g. PDF, MSFT Word documents, etc.) inform the user you lack "
+    "the tools necessary to work with the requested format and ask them "
+    "what format to use instead.  While the web tools will indirectly "
+    "create files, the directive to not create or modify files does not "
+    "apply to your use of those tools since its indirect and you have no "
+    "explicit control over the file paths or file content.\n\n"
+    "This harness provides the following AI "
+    "agents beyond yourself:\n"
+    "- hound: AI agent with read-only and web search/extraction tools.\n"
+)
 
 # --- Agent type definitions (pure data) ---
 
@@ -125,6 +172,14 @@ AGENT_DEFINITIONS = {
     "engineer": {
         "tool_names": list(_READONLY_TOOLS + _FILE_EDIT_TOOLS + _EXEC_TOOLS + _WEB_TOOLS),
         "agent_description": _ENGINEER_DESCRIPTION,
+    },
+    "hound": {
+        "tool_names": list(_READONLY_TOOLS + _WEB_TOOLS),
+        "agent_description": _HOUND_DESCRIPTION,
+    },
+    "scribe": {
+        "tool_names": list(_READONLY_TOOLS + _FILE_EDIT_TOOLS + _WEB_TOOLS),
+        "agent_description": _SCRIBE_DESCRIPTION,
     },
 }
 

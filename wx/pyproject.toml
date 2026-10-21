@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fluximp-wxwidgets"
-version = "0.2.0"
+version = "0.3.0"
 description = "FluxImp wxWidgets: desktop GUI providing multiple AI agent workflows for coding and web research"
 readme = "README.md"
 authors = [
@@ -13,9 +13,14 @@ authors = [
 requires-python = ">=3.10,<3.13"
 license = "MPL-2.0"
 dependencies = [
-    "fluximp-agent==0.2.0",
-    "fluximp-protocol==0.2.0",
-    "wxPython==4.2.5",
+    "fluximp-agent==0.3.0",
+    "fluximp-protocol==0.3.0",
+    # 4.3 is the first release built on wxWidgets 3.3, which added the
+    # portable dark-mode support the themes use for the title bar, the menu
+    # bar and the standard controls (wx.App.SetAppearance).  The theming code
+    # degrades to a no-op on older wx rather than failing, but the dark themes
+    # would then leave those three surfaces light.
+    "wxPython==4.3.2",
     "mistune==3.3.4",
 ]
 

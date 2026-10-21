@@ -3,6 +3,10 @@ from typing import Dict, Any, Optional, Tuple, List
 from fluximp_agent.model_config import ModelConfig, get_model_capabilities
 from fluximp_agent.agent_config import AgentConfig
 from fluximp_agent.tools.common import create_aggregate_diff
+from fluximp_agent.context_managment_constants import (
+    VIEW_BUDGET_DESC,
+    VIEW_CAPACITY_WARN_FRACTION,
+)
 from fluximp_agent.context_injection_manager import ContextChunk
 
 
@@ -60,7 +64,7 @@ class FileSystemAgent(AgentConfig):
         "undo": ["undo usage example:", "undo()"],
         "send_message": [
             "send_message usage example:",
-            'send_message(tags=["work_completion_summary"], content="I\'ve created the requested file for you.", format="plain_text")',
+            'send_message(tags=["work_completion_summary"], content="I\'ve created the requested file for you.", format="markdown")',
         ],
         "ripgrep_search": [
             "ripgrep_search usage example:",
@@ -352,13 +356,13 @@ Free form text will not be displayed to the user.  The send_message tool allows 
                 # otherwise the percentage is noise the LLM needlessly worries about
                 capacity_parts = []
                 close_views_enabled = experiments_service and experiments_service.is_enabled("close_views")
-                if close_views_enabled and fraction_used >= 0.80:
+                if close_views_enabled and fraction_used >= VIEW_CAPACITY_WARN_FRACTION:
                     capacity_parts.append(
-                        f"\nView capacity used:  {fraction_used*100.0:.1f}%\n"
+                        f"\nView capacity used: {fraction_used*100.0:.1f}% of {VIEW_BUDGET_DESC}\n"
                     )
                 if files_removed:
                     capacity_parts.append(
-                        f"Open views exceeded capacity; {len(files_removed)} files automatically closed:\n"
+                        f"Open views exceeded view content budget of {VIEW_BUDGET_DESC}; {len(files_removed)} files automatically closed:\n"
                     )
                     capacity_parts.extend(files_removed)
                     capacity_parts.append("Use more targeted ranges if you are going to immediately add windows views for any of the files just auto-closed.")
@@ -405,8 +409,6 @@ Free form text will not be displayed to the user.  The send_message tool allows 
                 # operation_position changed - recompute the diff
                 file_states = {}
                 for op in file_ops[:op_pos + 1] if op_pos >= 0 else []:
-                    if op.file_path is None:
-                        continue
                     is_deleted = op.operation_type == "delete_file"
                     if op.file_path not in file_states:
                         file_states[op.file_path] = (op.compressed_before, is_deleted)
@@ -435,7 +437,7 @@ Free form text will not be displayed to the user.  The send_message tool allows 
                 
                 if modified_file_paths:
                     filtered_ops = [op for op in file_ops[:op_pos + 1]
-                                    if op.file_path in modified_file_paths or op.file_path is None]
+                                    if op.file_path in modified_file_paths]
                     diff = create_aggregate_diff(
                         filtered_ops,
                         len(filtered_ops) - 1,

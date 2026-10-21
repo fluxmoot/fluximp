@@ -7,6 +7,7 @@ from fluximp_wxwidgets.workflow_config import (
     WorkflowConfigManager, WorkflowConfig, AgentConfigInfo,
     ConditionalAgentConfigInfo, EventSequenceGroup, STOCK_WORKFLOW_NAME
 )
+from fluximp_wxwidgets.icon_bitmaps import icon_bundle
 
 
 
@@ -21,12 +22,20 @@ class WorkflowTreeCtrl(wx.TreeCtrl):
     def __init__(self, parent, config_mgr: WorkflowConfigManager):
         super().__init__(parent, style=wx.TR_DEFAULT_STYLE | wx.TR_HIDE_ROOT)
         self.config_mgr = config_mgr
-        self.img_list = wx.ImageList(16, 16)
-        self.img_workflow = self.img_list.Add(self._create_workflow_bitmap())
-        self.img_agent = self.img_list.Add(self._create_agent_bitmap())
-        self.img_event = self.img_list.Add(self._create_event_bitmap())
-        self.img_group = self.img_list.Add(self._create_sequence_group_bitmap())
-        self.SetImageList(self.img_list)
+        # Icons: transparent and DPI-aware (see icon_bitmaps).  SetImages
+        # takes a wx.BitmapBundle per image, so the tree scales them for a
+        # HiDPI display instead of showing a fixed 16 physical pixels; the
+        # indices below are what AppendItem's image= parameter takes.
+        self.SetImages([
+            icon_bundle(self._draw_workflow),
+            icon_bundle(self._draw_agent),
+            icon_bundle(self._draw_event),
+            icon_bundle(self._draw_sequence_group),
+        ])
+        self.img_workflow = 0
+        self.img_agent = 1
+        self.img_event = 2
+        self.img_group = 3
         self.root = self.AddRoot("Workflows")
         self.Bind(wx.EVT_TREE_ITEM_ACTIVATED, self._on_item_activated)
         self.Bind(wx.EVT_TREE_ITEM_RIGHT_CLICK, self._on_item_right_click)
@@ -36,51 +45,42 @@ class WorkflowTreeCtrl(wx.TreeCtrl):
         self.on_start_conversation: Optional[Callable[[str], None]] = None
         self._refresh_tree()
 
-    def _create_workflow_bitmap(self) -> wx.Bitmap:
-        bmp = wx.Bitmap(16, 16)
-        dc = wx.MemoryDC(bmp)
-        dc.SetBackground(wx.Brush(wx.Colour(240, 240, 240)))
-        dc.Clear()
-        dc.SetPen(wx.Pen(wx.Colour(80, 120, 200)))
-        dc.SetBrush(wx.Brush(wx.Colour(130, 170, 230)))
-        dc.DrawRoundedRectangle(1, 1, 14, 14, 3)
-        dc.SelectObject(wx.NullBitmap)
-        return bmp
+    @staticmethod
+    def _draw_workflow(gc) -> None:
+        """Paint the workflow icon into a 16x16 logical box.
 
+        No background is painted: the bitmap is transparent (see
+        icon_bitmaps), so whatever is not drawn here shows the tree's own
+        colour through, which is what lets one icon work on a light and on a
+        dark tree.
+        """
+        gc.SetPen(wx.Pen(wx.Colour(80, 120, 200)))
+        gc.SetBrush(wx.Brush(wx.Colour(130, 170, 230)))
+        gc.DrawRoundedRectangle(1, 1, 14, 14, 3)
 
-    def _create_agent_bitmap(self) -> wx.Bitmap:
-        bmp = wx.Bitmap(16, 16)
-        dc = wx.MemoryDC(bmp)
-        dc.SetBackground(wx.Brush(wx.Colour(240, 240, 240)))
-        dc.Clear()
-        dc.SetPen(wx.Pen(wx.Colour(60, 60, 60)))
-        dc.SetBrush(wx.Brush(wx.Colour(180, 180, 180)))
-        dc.DrawCircle(8, 5, 4)
-        dc.DrawRoundedRectangle(4, 10, 8, 5, 2)
-        dc.SelectObject(wx.NullBitmap)
-        return bmp
+    @staticmethod
+    def _draw_agent(gc) -> None:
+        """Paint the agent icon into a 16x16 logical box (see _draw_workflow)."""
+        gc.SetPen(wx.Pen(wx.Colour(60, 60, 60)))
+        gc.SetBrush(wx.Brush(wx.Colour(180, 180, 180)))
+        # DrawCircle(8, 5, 4) was centre+radius; DrawEllipse takes the
+        # top-left corner and a size, hence (4, 1, 8, 8) for the same circle.
+        gc.DrawEllipse(4, 1, 8, 8)
+        gc.DrawRoundedRectangle(4, 10, 8, 5, 2)
 
-    def _create_event_bitmap(self) -> wx.Bitmap:
-        bmp = wx.Bitmap(16, 16)
-        dc = wx.MemoryDC(bmp)
-        dc.SetBackground(wx.Brush(wx.Colour(240, 240, 240)))
-        dc.Clear()
-        dc.SetPen(wx.Pen(wx.Colour(200, 120, 0)))
-        dc.SetBrush(wx.Brush(wx.Colour(255, 165, 0)))
-        dc.DrawRoundedRectangle(2, 2, 12, 12, 2)
-        dc.SelectObject(wx.NullBitmap)
-        return bmp
+    @staticmethod
+    def _draw_event(gc) -> None:
+        """Paint the event icon into a 16x16 logical box (see _draw_workflow)."""
+        gc.SetPen(wx.Pen(wx.Colour(200, 120, 0)))
+        gc.SetBrush(wx.Brush(wx.Colour(255, 165, 0)))
+        gc.DrawRoundedRectangle(2, 2, 12, 12, 2)
 
-    def _create_sequence_group_bitmap(self) -> wx.Bitmap:
-        bmp = wx.Bitmap(16, 16)
-        dc = wx.MemoryDC(bmp)
-        dc.SetBackground(wx.Brush(wx.Colour(240, 240, 240)))
-        dc.Clear()
-        dc.SetPen(wx.Pen(wx.Colour(0, 120, 60)))
-        dc.SetBrush(wx.Brush(wx.Colour(80, 180, 120)))
-        dc.DrawRoundedRectangle(2, 2, 12, 12, 2)
-        dc.SelectObject(wx.NullBitmap)
-        return bmp
+    @staticmethod
+    def _draw_sequence_group(gc) -> None:
+        """Paint the sequence-group icon into a 16x16 logical box."""
+        gc.SetPen(wx.Pen(wx.Colour(0, 120, 60)))
+        gc.SetBrush(wx.Brush(wx.Colour(80, 180, 120)))
+        gc.DrawRoundedRectangle(2, 2, 12, 12, 2)
 
     def _refresh_tree(self):
         self.DeleteChildren(self.root)
@@ -180,7 +180,7 @@ class WorkflowTreeCtrl(wx.TreeCtrl):
         if self.config_mgr.is_stock_workflow(workflow_name):
             id_restore = wx.NewIdRef()
             menu.Append(id_restore, "Restore Stock Workflow")
-            menu.Bind(wx.EVT_MENU, lambda e: self._on_restore_stock_workflow(), id=id_restore)
+            menu.Bind(wx.EVT_MENU, lambda e: self._on_restore_stock_workflow(workflow_name), id=id_restore)
         else:
             id_delete = wx.NewIdRef()
             menu.Append(id_delete, "Delete Workflow")
@@ -283,8 +283,8 @@ class WorkflowTreeCtrl(wx.TreeCtrl):
         if self.on_start_conversation:
             self.on_start_conversation(workflow_name)
 
-    def _on_restore_stock_workflow(self):
-        self.config_mgr.restore_stock_workflow()
+    def _on_restore_stock_workflow(self, workflow_name: str):
+        self.config_mgr.restore_stock_workflow(workflow_name)
         self._refresh_tree()
         if self.on_agents_changed:
             self.on_agents_changed()

@@ -9,6 +9,7 @@ Both main.py and test files import from here to ensure consistency.
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Any, Dict, Union
 from fluximp_agent.agent_config import ToolDef, ArgDef
+from fluximp_agent.context_managment_constants import VIEW_BUDGET_DESC
 from fluximp_agent.experiments import ExperimentsService
 
 
@@ -63,7 +64,7 @@ ARG_EXAMPLES: Dict[str, Union[str, int, bool, list]] = {
     
     # send_message args
     'tags': ['findings_report'],
-    'format': 'plain_text',
+    'format': 'markdown',
 }
 
 def get_tool_definitions(experiments_service: ExperimentsService = None) -> dict:
@@ -139,7 +140,7 @@ def get_tool_definitions(experiments_service: ExperimentsService = None) -> dict
   There is no tag that applies to reporting partial progress.  When none of the tags are applicable to the message content that is very stronger indicator that the message should not be sent.
 ''', required=True, tags=frozenset({'metadata'})),
             ArgDef(name="content", arg_type="string", description="The message content to send to the user", required=True, tags=frozenset({'message'})),
-            ArgDef(name="format", arg_type="string", description='Format of the message content: "plain_text" or "markdown"', required=False, default='"plain_text"', tags=frozenset({'metadata'}))
+            ArgDef(name="format", arg_type="string", description='Format of the message content: "plain_text" or "markdown" (default: "markdown")', required=False, default='"markdown"', tags=frozenset({'metadata'}))
         ],
         func=None,
         is_state_modifying=False
@@ -221,7 +222,7 @@ def get_tool_definitions(experiments_service: ExperimentsService = None) -> dict
             func=None,
             is_state_modifying=True
         )
-    else:
+    elif experiments_service and experiments_service.is_enabled("edit_line_no_validation"):
         # Original version without content validation
         tools["edit_file_lines"] = ToolDef(
             name="edit_file_lines",
@@ -240,7 +241,7 @@ def get_tool_definitions(experiments_service: ExperimentsService = None) -> dict
     # apply_patch
     tools["apply_patch"] = ToolDef(
         name="apply_patch",
-        description="Apply a unified diff patch to files. The patch is preserved for undo operations.",
+        description="Apply a unified diff patch to files. Before/after content is stored per file for reliable undo/redo, and the changed regions are automatically added to the views and the cumulative diff.",
         category="filesystem",
         args=[
             ArgDef(name="diff_text", arg_type="string", description="Unified diff patch text to apply", required=True, tags=frozenset({'content'}))
@@ -484,7 +485,7 @@ def get_tool_definitions(experiments_service: ExperimentsService = None) -> dict
         
         tools["close_view"] = ToolDef(
             name="close_view",
-            description="Close views by their IDs (shown in [id] in view headers). Works for both file views (all view windows for the file) and search/list query views. Its not necessary to use this.  When view capacity is exceeded the oldest views will be automatically closed.  That said if you really don't need to see what's in a view (i.e. a file view window on a transient output file) you should close it to keep the context tight to both save the user money on token costs and avoid context rot degrading your performance.  Using close_view on a view id for a file after used add_file_view on that file in the same request is a very braindead, so just don't do that.  It is definitely not productive to call close_view frequently such as on every other response.",
+            description=f"Close views by their IDs (shown in [id] in view headers). Works for both file views (all view windows for the file) and search/list query views. Its not necessary to use this.  When view capacity (a view content budget of {VIEW_BUDGET_DESC}) is exceeded the oldest views will be automatically closed.  That said if you really don't need to see what's in a view (i.e. a file view window on a transient output file) you should close it to keep the context tight to both save the user money on token costs and avoid context rot degrading your performance.  Using close_view on a view id for a file after used add_file_view on that file in the same request is a very braindead, so just don't do that.  It is definitely not productive to call close_view frequently such as on every other response.",
             category="read_only",
             args=[
                 ArgDef(name="view_ids", arg_type="array", description="List of view IDs to close", required=True, tags=frozenset({'internal_id'}))
@@ -831,80 +832,81 @@ def get_tool_definitions(experiments_service: ExperimentsService = None) -> dict
             is_state_modifying=True
         )
 
-    # parallel_search tool - gated by "parallel_search" experiment
-    if experiments_service and experiments_service.is_enabled("parallel_search"):
-        tools["parallel_search"] = ToolDef(
-            name="parallel_search",
-            description=(
-                "Search the web using Parallel's declarative semantic search API. "
-                "Uses a proprietary web index of billions of pages. "
-                "Provide keyword search_queries (2-3 concise queries, 3-6 words each) "
-                "plus an optional natural-language objective that describes your goal. "
-                "Returns ranked URLs with token-dense compressed excerpts. "
-                "Use mode='turbo' for fastest, mode='basic' for low latency, "
-                "or mode='advanced' (default) for highest quality. "
-                "Use session_id to link search and extract calls. "
-                "Raw JSON response is saved to a file and added to your file view windows."
-            ),
-            category="filesystem_modify",
-            args=[
-                ArgDef(name="search_queries", arg_type="array",
-                       description='List of 2-3 concise keyword queries, 3-6 words each, e.g., ["python async guide", "asyncio tutorial"]',
-                       required=True),
-                ArgDef(name="objective", arg_type="string",
-                       description="Natural-language description of your underlying goal or question (max 5000 chars)",
-                       required=False),
-                ArgDef(name="mode", arg_type="string",
-                       description="Search mode: turbo (fastest), basic (low latency), advanced (highest quality, default)",
-                       required=False),
-                ArgDef(name="max_chars_total", arg_type="integer",
-                       description="Upper bound on total characters across all excerpts",
-                       required=False),
-                ArgDef(name="session_id", arg_type="string",
-                       description="Session ID to link search and extract calls for better contextual results",
-                       required=False),
-            ],
-            func=None,
-            is_state_modifying=True
-        )
+    if False:
+        # parallel_search tool - gated by "parallel_search" experiment
+        if experiments_service and experiments_service.is_enabled("parallel_search"):
+            tools["parallel_search"] = ToolDef(
+                name="parallel_search",
+                description=(
+                    "Search the web using Parallel's declarative semantic search API. "
+                    "Uses a proprietary web index of billions of pages. "
+                    "Provide keyword search_queries (2-3 concise queries, 3-6 words each) "
+                    "plus an optional natural-language objective that describes your goal. "
+                    "Returns ranked URLs with token-dense compressed excerpts. "
+                    "Use mode='turbo' for fastest, mode='basic' for low latency, "
+                    "or mode='advanced' (default) for highest quality. "
+                    "Use session_id to link search and extract calls. "
+                    "Raw JSON response is saved to a file and added to your file view windows."
+                ),
+                category="filesystem_modify",
+                args=[
+                    ArgDef(name="search_queries", arg_type="array",
+                        description='List of 2-3 concise keyword queries, 3-6 words each, e.g., ["python async guide", "asyncio tutorial"]',
+                        required=True),
+                    ArgDef(name="objective", arg_type="string",
+                        description="Natural-language description of your underlying goal or question (max 5000 chars)",
+                        required=False),
+                    ArgDef(name="mode", arg_type="string",
+                        description="Search mode: turbo (fastest), basic (low latency), advanced (highest quality, default)",
+                        required=False),
+                    ArgDef(name="max_chars_total", arg_type="integer",
+                        description="Upper bound on total characters across all excerpts",
+                        required=False),
+                    ArgDef(name="session_id", arg_type="string",
+                        description="Session ID to link search and extract calls for better contextual results",
+                        required=False),
+                ],
+                func=None,
+                is_state_modifying=True
+            )
 
-    # parallel_extract tool - gated by "parallel_extract" experiment
-    if experiments_service and experiments_service.is_enabled("parallel_extract"):
-        tools["parallel_extract"] = ToolDef(
-            name="parallel_extract",
-            description=(
-                "Extract content from URLs using Parallel's objective-driven extraction API. "
-                "Extracts content from specific URLs with optional objective-driven excerpts. "
-                "By default returns ranked excerpts; set full_content=true for full page markdown. "
-                "Handles JavaScript-rendered pages and PDFs. Up to 20 URLs per request. "
-                "Use objective to focus excerpts on relevant content. "
-                "Use session_id to link search and extract calls. "
-                "Raw JSON response is saved to a file and added to your file view windows."
-            ),
-            category="filesystem_modify",
-            args=[
-                ArgDef(name="urls", arg_type="array",
-                       description='List of URLs to extract content from (up to 20), e.g., ["https://example.com/page1"]',
-                       required=True),
-                ArgDef(name="objective", arg_type="string",
-                       description="Natural-language extraction goal. When provided, excerpts are focused on relevant content.",
-                       required=False),
-                ArgDef(name="search_queries", arg_type="array",
-                       description="Optional keyword queries to focus excerpts",
-                       required=False),
-                ArgDef(name="full_content", arg_type="boolean",
-                       description="If true, also return full page markdown content (default: false, excerpts only)",
-                       required=False),
-                ArgDef(name="max_chars_total", arg_type="integer",
-                       description="Upper bound on total excerpt characters",
-                       required=False),
-                ArgDef(name="session_id", arg_type="string",
-                       description="Session ID to link search and extract calls for better contextual results",
-                       required=False),
-            ],
-            func=None,
-            is_state_modifying=True
-        )
+        # parallel_extract tool - gated by "parallel_extract" experiment
+        if experiments_service and experiments_service.is_enabled("parallel_extract"):
+            tools["parallel_extract"] = ToolDef(
+                name="parallel_extract",
+                description=(
+                    "Extract content from URLs using Parallel's objective-driven extraction API. "
+                    "Extracts content from specific URLs with optional objective-driven excerpts. "
+                    "By default returns ranked excerpts; set full_content=true for full page markdown. "
+                    "Handles JavaScript-rendered pages and PDFs. Up to 20 URLs per request. "
+                    "Use objective to focus excerpts on relevant content. "
+                    "Use session_id to link search and extract calls. "
+                    "Raw JSON response is saved to a file and added to your file view windows."
+                ),
+                category="filesystem_modify",
+                args=[
+                    ArgDef(name="urls", arg_type="array",
+                        description='List of URLs to extract content from (up to 20), e.g., ["https://example.com/page1"]',
+                        required=True),
+                    ArgDef(name="objective", arg_type="string",
+                        description="Natural-language extraction goal. When provided, excerpts are focused on relevant content.",
+                        required=False),
+                    ArgDef(name="search_queries", arg_type="array",
+                        description="Optional keyword queries to focus excerpts",
+                        required=False),
+                    ArgDef(name="full_content", arg_type="boolean",
+                        description="If true, also return full page markdown content (default: false, excerpts only)",
+                        required=False),
+                    ArgDef(name="max_chars_total", arg_type="integer",
+                        description="Upper bound on total excerpt characters",
+                        required=False),
+                    ArgDef(name="session_id", arg_type="string",
+                        description="Session ID to link search and extract calls for better contextual results",
+                        required=False),
+                ],
+                func=None,
+                is_state_modifying=True
+            )
 
     # perplexity_search tool - gated by "perplexity_search" experiment
     if experiments_service and experiments_service.is_enabled("perplexity_search"):
@@ -955,6 +957,87 @@ def get_tool_definitions(experiments_service: ExperimentsService = None) -> dict
             is_state_modifying=True
         )
 
+    # firecrawl_search tool - gated by "firecrawl_search" experiment
+    if experiments_service and experiments_service.is_enabled("firecrawl_search"):
+        tools["firecrawl_search"] = ToolDef(
+            name="firecrawl_search",
+            description=(
+                "Search the web using Firecrawl's search API. "
+                "Returns web, news, and image results from Firecrawl's index. "
+                "Use 'site:example.com' in the query to limit results to a domain. "
+                "Raw JSON response is saved to a file and added to your file view windows. "
+                "Use sources=['web', 'news'] to search multiple sources in one call. "
+                "Use categories=['research'] for academic results or ['pdf'] for PDF-focused results."
+            ),
+            category="filesystem_modify",
+            args=[
+                ArgDef(name="query", arg_type="string",
+                       description="Search query string. Use 'site:example.com' to limit results to a domain.",
+                       required=True),
+                ArgDef(name="sources", arg_type="array",
+                       description="List of sources to search: 'web', 'news', 'images' (default: web)",
+                       required=False),
+                ArgDef(name="categories", arg_type="array",
+                       description="List of categories to filter results: 'developer', 'gov', 'research', 'pdf'",
+                       required=False),
+                ArgDef(name="limit", arg_type="integer",
+                       description="Maximum number of results per source (default: 5)",
+                       required=False),
+                ArgDef(name="tbs", arg_type="string",
+                       description="Time-based filter, e.g. 'qdr:d' (past day), 'qdr:w' (past week)",
+                       required=False),
+                ArgDef(name="location", arg_type="string",
+                       description="Localized results, e.g. 'San Francisco,California,United States'",
+                       required=False),
+                ArgDef(name="ignore_invalid_urls", arg_type="boolean",
+                       description="Drop URLs that cannot be scraped by other endpoints (default: false)",
+                       required=False),
+                ArgDef(name="timeout", arg_type="integer",
+                       description="Request timeout in milliseconds (default: 300000)",
+                       required=False),
+            ],
+            func=None,
+            is_state_modifying=True
+        )
+
+    # firecrawl_scrape tool - gated by "firecrawl_scrape" experiment
+    if experiments_service and experiments_service.is_enabled("firecrawl_scrape"):
+        tools["firecrawl_scrape"] = ToolDef(
+            name="firecrawl_scrape",
+            description=(
+                "Scrape a single URL using Firecrawl's scrape API. "
+                "Returns clean markdown (default) plus any other requested formats. "
+                "Handles JavaScript-rendered pages, PDFs, and anti-bot protection server-side. "
+                "Accepts a single URL (not a list). "
+                "Raw JSON response is saved to a file and added to your file view windows."
+            ),
+            category="filesystem_modify",
+            args=[
+                ArgDef(name="url", arg_type="string",
+                       description="URL to scrape (single URL, not a list)",
+                       required=True),
+                ArgDef(name="formats", arg_type="array",
+                       description="List of output formats: 'markdown' (default), 'html', 'rawHtml', 'links', 'images', 'screenshot', 'summary'",
+                       required=False),
+                ArgDef(name="only_main_content", arg_type="boolean",
+                       description="Strip nav, footer, and other boilerplate (default: true)",
+                       required=False),
+                ArgDef(name="wait_for", arg_type="integer",
+                       description="Milliseconds to wait for the page to render before scraping",
+                       required=False),
+                ArgDef(name="max_age", arg_type="integer",
+                       description="Return cached content up to this age in milliseconds (avoids redundant scrapes)",
+                       required=False),
+                ArgDef(name="proxy", arg_type="string",
+                       description="Proxy control: 'basic', 'stealth', 'enhanced', 'auto'",
+                       required=False),
+                ArgDef(name="timeout", arg_type="integer",
+                       description="Request timeout in milliseconds",
+                       required=False),
+            ],
+            func=None,
+            is_state_modifying=True
+        )
     return tools
 
 

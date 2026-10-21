@@ -6,7 +6,11 @@ FluxImp's approach to context management priotizes the direct conversation betwe
 
 The GUI allows you to customize most of the system prompt the harness provides to the LLMs.  The only parts you can't customize through the GUI are the instructions for tool use that are partly programatically generated based on the available tools (i.e. the limitation technical & UX not philosphical).
 
-![](docs\screenshot\Windows.png?raw=true)
+**Amethyst theme**
+![](docs\screenshot\Windows-Amethyst.png?raw=true)
+
+**Nightshade theme**
+![](docs\screenshot\Windows-Nightshade.png?raw=true)
 
 ## Quick Start
 
@@ -24,10 +28,10 @@ wget https://github.com/conda-forge/miniforge/releases/download/25.11.0-1/Minifo
 bash Miniforge3-Linux-x86_64.sh
 ```
 
-The fiddly part is getting wxPython version 4.2.5 installed.  If this works:
+The fiddly part is getting wxPython version 4.3.2 installed.  If this works:
 
 ```console
-python -m pip wxPython==4.2.5
+python -m pip wxPython==4.3.2
 ```
 
 then you're good to go.  If it fails to build, you could try to get things setup so that pip can build the wheel successfully.   You could also try installing using conda too.
@@ -35,7 +39,7 @@ then you're good to go.  If it fails to build, you could try to get things setup
 There are prebuilt wheels that can be installed, but you'll have to modify the URL to match your distro version and your Python interpreter version.  This URL in this command is known to work for Ubuntu version 24.04 with Python version 2.10:
 
 ```console
-python -m pip install -U https://github.com/wxWidgets/Phoenix/releases/download/wxPython-4.2.5/wxpython-4.2.5+ubuntu2404-cp310-cp310-linux_x86_64.whl
+python -m pip install -U https://github.com/wxWidgets/Phoenix/releases/download/wxPython-4.3.2/wxpython-4.3.2+ubuntu2404-cp310-cp310-linux_x86_64.whl
 ```
 
 There are two system dependencies that may not be in installed already.  They aren't necessary for the pip install of the prebuilt wheels to succeed and you could wait to see if you get an exception about not being able to import one or both when you start the GUI.  Or you could check and see if they are already installed:
@@ -68,18 +72,20 @@ python -m pip install fluximp-wxwidgets
 python -m keyring set deepinfra.com api_key
 python -m keyring set together.ai api_key
 python -m keyring set friendli.ai api_key
+python -m keyring set makora.com api_key
 python -m keyring set fireworks.ai api_key
+python -m keyring set wandb.ai api_key
 python -m keyring set siliconflow.com api_key
 ```
 
 4) [Optionally] configure the keyring with at least one web search & fetch provider API key:
 
 ```console
-python -m keyring set tinyfish.ai api_key
 python -m keyring set exa.ai api_key
+python -m keyring set tinyfish.ai api_key
+python -m keyring set firecrawl.dev api_key
 python -m keyring set tavily.com api_key
 python -m keyring set perplexity.ai api_key
-python -m keyring set parallel.ai api_key
 ```
 
 5) Start the FluxImp desktop GUI
@@ -113,7 +119,7 @@ cd <repo parent dir>
 
 ## Workflows
 
-You can customize all of the stock agents included in the stock Dev Workflow and you can create new workflows.   You can add new agents to the stock Dev Workflow and your custom workflows.  You can also define a sequence of custom agents (aka conditional agents) to be run when the LLM sends you a message with the `work_completion_summary` tag (e.g. a series of code review agents).  When a conditional agents runs and finds a problem its the text it provides in its report will be populate the message box, so you can send it as is, add to, edit it, or ignore it as you please.
+You can customize all of the stock agents included in the stock Coding and Web Research workflows and you can create new workflows.   You can add new agents to the stock workflows and your custom workflows.  You can also define a sequence of custom agents (aka conditional agents) to be run when the LLM sends you a message with the `work_completion_summary` tag (e.g. a series of code review agents).  When a conditional agents runs and finds a problem its the text it provides in its report will be populate the message box, so you can send it as is, add to, edit it, or ignore it as you please.
 
 FluxImp has a code-not-text philosphy due to LLMs frequently not fully following the rules and guidelines laid out in AGENTS.md / CLAUDE.md files.  As part of that philophy FluxImp does not currently directly support AGENTS.md (i.e. they are just treated as regular files with no special treatment).  Conditional agents are a replacement to the rules and guidelines that would go into AGENTS.md.  LLMs can only reason about limited number of things in one session, so a single review agent can't be relied on to catch violations of a large set of rules and guidlines.  Due to those limitations FluxImp supports running an arbitrary sequence of conditional agents rather than be limited to just one.
 
@@ -146,6 +152,12 @@ The most common way LLMs corrupt text files is by rewriting them in their entire
 FluxImp also provides LLMs with tools for web search and web fetch that do not use the local browser and instead use purpose built provider APIs.  You'll need an account with the web search/fetch API providers to get an API key just like with the LLM inference API providers.  Its been really interesting using a research agent with these tools, as they come up with results that don't show up in the big search engines.  It really shows how enshitified the big search engines are.
 
 Finally FluxImp can provide LLMs with a run_tests tool if you integrate your own Python plugins to normalize the output of your test runners.  The test runners themselves don't need to written in Python, just the plugins.  This approach is arises from the code-not-text philosphy.  Instead of bunch of text to inform LLMs on who to run the tests and and navigate diagnostics just create code that does it deterministically instead instead of burning tokesn making LLMs run throught the same reasoning repeatedly (or worse yet burning tokens scanning verbose test outputs for to determine there are even failiures or not).
+
+### Execution Guards
+
+The run_python_script tool will mechanically request your approval before running a Python script that was newly created in the workflow prior to that tool use.  Similarly the run_tests tool will mechnically request your approval before running a test runner plugin Python module that was newly created in the workflow prior to that tool use.
+
+When not mechanically requesting your approval both tools will start the Scrutinator system agent to review the current, cumulative diff since the start of the workflow or since the last execution (i.e. what's changed since the last execution).  If the Scrutinator reports anything suspicious in the diff you be notified of what it found and your approval will be required before the execution occurs.
 
 ## License
 

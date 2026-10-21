@@ -507,7 +507,7 @@ def write_payload(handle: BinaryIO, payload_type: str, payload: Optional[str],
 
 def write_model_message_to_user(handle: BinaryIO, payload: Optional[str],
                                 tags: List[str] = None,
-                                format: str = "plain_text",
+                                format: str = "markdown",
                                 file_id: Optional[str] = None):
     """Write a model_message_to_user payload to the output stream.
 

@@ -171,6 +171,17 @@ class ToolMessageCompatibilityTransformer:
     - (True, False): Only ToolMessages marked with no_tool_use_error=True
       are converted to HumanMessage
     - (False, *): All ToolMessage are converted to HumanMessage
+
+    Note on prefix caching: role conversion does NOT break the prefix cache.
+    use_tool_messages / use_tool_message_for_no_tool_error are fixed at
+    construction (see BaseAgentNode.__init__) and never reassigned, so this
+    transform is a deterministic function of the message and that fixed config:
+    a given ToolMessage is converted identically from the very first request
+    that includes it. A prefix cache breaks only on a transition in the
+    serialized bytes at a position across consecutive requests; here there is
+    no before/after transition, so no break. (The only way the same history
+    serializes differently is a change of agent type -- attributable to the
+    agent-type / cache-key change, not to role conversion.)
     """
     
     def __init__(self, use_tool_messages: bool, use_tool_message_for_no_tool_error: bool):

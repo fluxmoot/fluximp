@@ -174,7 +174,7 @@ def time_travel_to_checkpoint(
         if not success:
             raise Exception(f"Failed to reverse {op.operation_type} on {op.file_path}: {error}")
         num_reversed += 1
-        if os.path.exists(op.file_path):
+        if op.file_path and os.path.exists(op.file_path):
             #print("DEBUG after reverse", Path(op.file_path).read_text(encoding="utf-8"))
             print("DEBUG file exists after reverse")
         else:

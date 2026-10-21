@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
 from fluximp_agent.tools.common import FileOperation, compress, lines_match
+from fluximp_agent.filesystem_service import check_line_mode_file_size
 from fluximp_agent.tools.tool_definitions import ToolResult
 from fluximp_agent.tool_call_omission import OMISSION_PLACEHOLDER_RE
 
@@ -54,6 +55,9 @@ def insert_lines_tool(file_path: str, insert_line: int, new_content: str,
     if not path.exists() or not path.is_file():
         return ToolResult(success=False, content=f"Error: File '{file_path}' not found")
 
+    size_error = check_line_mode_file_size(path, file_path)
+    if size_error:
+        return ToolResult(success=False, content=size_error)
     # Read original content
     try:
         original_content = path.read_text(encoding='utf-8')
@@ -164,6 +168,9 @@ def insert_lines_tool_validated(file_path: str, insert_line: int, anchor_line_co
     if not path.exists() or not path.is_file():
         return ToolResult(success=False, content=f"Error: File '{file_path}' not found")
 
+    size_error = check_line_mode_file_size(path, file_path)
+    if size_error:
+        return ToolResult(success=False, content=size_error)
     # Read original content
     try:
         original_content = path.read_text(encoding='utf-8')
